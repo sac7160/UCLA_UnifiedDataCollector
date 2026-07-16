@@ -6,10 +6,10 @@ A system for simultaneously collecting Galaxy Watch8 IMU/audio, a surface contac
 
 | Stream                | Source               | Notes                                                |
 | --------------------- | -------------------- | ---------------------------------------------------- |
-| Watch IMU (acc/gyro)  | Galaxy Watch7, TCP   | Includes a timestamp based on the watch's own clock  |
+| Watch IMU (acc/gyro)  | Galaxy Watch8, TCP   | Includes a timestamp based on the watch's own clock  |
 | Watch audio           | Galaxy Watch8, TCP   | Each frame (40ms) includes its own capture timestamp |
 | Surface mic           | USB audio interface  | Surface-contact microphone (ASIN B0F5GGGSNG)         |
-| Fingertip virtual IMU | PC camera, MediaPipe | Accel/gyro/pos for all 5 fingertips                  |
+| Fingertip virtual IMU | PC camera, MediaPipe | Accel/gyro for all 5 fingertips                      |
 
 ---
 
