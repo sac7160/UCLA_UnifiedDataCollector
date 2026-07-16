@@ -1,4 +1,5 @@
 //// (c) 2025, KAIST, WIT_LAB, Jiwan Kim (jiwankim@kaist.ac.kr, kjwan4435@gmail.com)
+// 2026 KAIST, HCITECH LAB, Chanhyeon Park modifed
 //
 //import android.annotation.SuppressLint;
 //import android.media.AudioFormat;
@@ -225,6 +226,8 @@
 
 // (c) 2025, KAIST, WIT_LAB, Jiwan Kim (jiwankim@kaist.ac.kr, kjwan4435@gmail.com)
 // Modified: IMU real-time streaming added
+// 2026 KAIST, HCITECH LAB, Chanhyeon Park modifed
+
 
 import android.annotation.SuppressLint;
 import android.media.AudioFormat;
@@ -233,15 +236,19 @@ import android.media.MediaRecorder;
 import android.media.audiofx.AcousticEchoCanceler;
 import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
-import android.os.AsyncTask;
 import android.util.Log;
 
 import java.io.BufferedOutputStream;
 import java.io.DataOutputStream;
+import java.io.IOException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 public class DataRecorder {
 
@@ -273,10 +280,149 @@ public class DataRecorder {
     boolean currentlyRecordingAudio = false;
     boolean sendMsg;
 
-    // ── Audio streaming (unchanged) ──────────────────────────────────────────
+    // Number of bytes used for the per-frame capture timestamp prefix
+    // (a big-endian long / System.currentTimeMillis()).
+    private static final int FRAME_TS_BYTES = 8;
+
+    // ── Persistent connection ────────────────────────────────────────────────
+    //
+    // Previously, every single message (each ~40ms audio frame, every IMU
+    // chunk) opened a BRAND NEW Socket via AsyncTask.execute(), which by
+    // default runs on a single shared SERIAL executor. Two problems fell out
+    // of that, confirmed by the captured data (a ~30s recording taking
+    // ~39-48s of real time to fully arrive, with content intact but badly
+    // time-smeared):
+    //   1. Socket connect() had no explicit timeout, so a single slow/failed
+    //      connection attempt could block for a long OS-default timeout.
+    //   2. Because the executor is serial, that one stuck task blocked EVERY
+    //      later-queued message (audio and IMU alike) behind it, and capture
+    //      kept piling up behind the block — a small stall snowballs into a
+    //      much larger one.
+    //
+    // This does NOT make the pipeline immune to network delay — a genuinely
+    // dead WiFi link for several seconds still means that interval's data
+    // can't be delivered, and a very long, sustained outage will eventually
+    // overflow the bounded send queue and start dropping the oldest pending
+    // messages (see MAX_QUEUE_SIZE below). What it does fix is the snowball
+    // effect: a transient stall no longer blocks everything queued behind
+    // it, and reconnects happen quickly (CONNECT_TIMEOUT_MS) instead of
+    // waiting on an OS-default timeout that can run into tens of seconds.
+    private static final int WATCH_PORT           = 50005;
+    private static final int CONNECT_TIMEOUT_MS   = 1000;
+    private static final int RECONNECT_BACKOFF_MS = 200;
+    private static final int MAX_QUEUE_SIZE        = 500;
+
+    private final BlockingQueue<byte[]> sendQueue = new LinkedBlockingQueue<>();
+    private Thread writerThread;
+    private volatile boolean writerRunning = false;
+
+    private Socket persistentSocket;
+    private DataOutputStream persistentOut;
+
+    private synchronized void startPersistentConnectionIfNeeded(String ip) {
+        currentIp = ip;
+        if (writerRunning) return;
+        writerRunning = true;
+        writerThread = new Thread(this::writerLoop, "WatchStreamWriter");
+        writerThread.setDaemon(true);
+        writerThread.start();
+    }
+
+    /** Call when the whole recording session is done, to close the
+     * connection after any remaining queued messages have drained. */
+    public void closeConnection() {
+        writerRunning = false;
+        if (writerThread != null) {
+            try {
+                writerThread.join(1000);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    private void enqueue(byte[] msg) {
+        if (sendQueue.size() >= MAX_QUEUE_SIZE) {
+            sendQueue.poll();   // drop the oldest pending message — better to
+                                 // stay current than build an ever-growing
+                                 // backlog during a sustained outage
+        }
+        sendQueue.offer(msg);
+    }
+
+    private boolean ensureConnected() {
+        if (persistentSocket != null && persistentSocket.isConnected() && !persistentSocket.isClosed()) {
+            return true;
+        }
+        try {
+            Socket s = new Socket();
+            s.setTcpNoDelay(true);   // disable Nagle's algorithm — these are small, latency-sensitive messages
+            s.connect(new InetSocketAddress(currentIp, WATCH_PORT), CONNECT_TIMEOUT_MS);
+            persistentOut     = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
+            persistentSocket  = s;
+            Log.w(TAG, "connected to " + currentIp + ":" + WATCH_PORT);
+            return true;
+        } catch (IOException e) {
+            closeSocketQuietly();
+            try {
+                Thread.sleep(RECONNECT_BACKOFF_MS);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+            }
+            return false;
+        }
+    }
+
+    private void closeSocketQuietly() {
+        if (persistentSocket != null) {
+            try {
+                persistentSocket.close();
+            } catch (IOException ignored) {
+            }
+        }
+        persistentSocket = null;
+        persistentOut = null;
+    }
+
+    private void writerLoop() {
+        while (writerRunning || !sendQueue.isEmpty()) {
+            byte[] msg;
+            try {
+                msg = sendQueue.poll(200, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                continue;
+            }
+            if (msg == null) continue;
+
+            if (!ensureConnected()) {
+                // Couldn't (re)connect within CONNECT_TIMEOUT_MS — drop this
+                // one message and move on to the next, rather than blocking
+                // everything behind it the way the old per-message sockets did.
+                continue;
+            }
+            try {
+                // 4-byte big-endian length prefix, then the raw message —
+                // lets the PC side split messages apart on a long-lived
+                // connection instead of relying on "one message per TCP
+                // connection" (which is what forced the old per-message
+                // socket design in the first place).
+                persistentOut.writeInt(msg.length);
+                persistentOut.write(msg);
+                persistentOut.flush();
+            } catch (IOException e) {
+                Log.w(TAG, "write failed, will reconnect: " + e);
+                closeSocketQuietly();
+            }
+        }
+        closeSocketQuietly();
+    }
+
+    // ── Audio streaming ──────────────────────────────────────────────────────
 
     public void startStreamingAudio(String ip, int duration, int id) {
         currentIp = ip;   // save IP for IMU streaming
+        startPersistentConnectionIfNeeded(ip);
         currentlyRecordingAudio = true;
         sendMsg = true;
         startStreaming(ip, duration, id);
@@ -329,7 +475,18 @@ public class DataRecorder {
                     Log.w(TAG, "Log/ maxPackets: " + maxPackets);
 
                     while (currentlyRecordingAudio) {
-                        int read = recorder.read(buffer, extraBytes + (BUFFER_SIZE * count), BUFFER_SIZE);
+                        int start = extraBytes + (BUFFER_SIZE * count);
+                        int read = recorder.read(buffer, start, BUFFER_SIZE);
+                        // Capture time for this specific frame, taken right after
+                        // the blocking read returns. Same clock
+                        // (System.currentTimeMillis()) as RTBGN/RTEND, so the PC
+                        // side can map it through the same rtbgn_watch_ms ↔
+                        // rtbgn_pc_sec reference already used for IMU. This no
+                        // longer depends on send_request() completing quickly,
+                        // since send_request() now just enqueues and returns
+                        // immediately (see below) — the capture loop itself is
+                        // no longer at the mercy of network timing.
+                        long frameTs = System.currentTimeMillis();
 
                         if (count == maxPackets) {
                             if (Utilities.IsRealtimeStreaming) {
@@ -340,25 +497,43 @@ public class DataRecorder {
                                 buffer[9]=(byte)(t>>24); buffer[10]=(byte)(t>>16);
                                 buffer[11]=(byte)(t>>8); buffer[12]=(byte)(t);
                                 send_request(ip, buffer, 13);
-                                //send_request(ip, buffer, 10);
                             }
                             currentlyRecordingAudio = false;
                         } else {
                             if (Utilities.IsRealtimeStreaming) {
-                                int start = extraBytes + (BUFFER_SIZE * count);
-                                int end   = start + BUFFER_SIZE;
+                                int end = start + BUFFER_SIZE;
+
+                                // Every audio frame — including frame 0 — is sent
+                                // as [8-byte big-endian timestamp][BUFFER_SIZE
+                                // bytes of PCM audio]. Frame 0's audio used to be
+                                // silently dropped (only the RTBGN header was
+                                // sent for it); it's now sent like every other
+                                // frame, just with its own timestamp attached.
+                                byte[] framePkt = new byte[FRAME_TS_BYTES + BUFFER_SIZE];
+                                framePkt[0] = (byte)(frameTs >> 56);
+                                framePkt[1] = (byte)(frameTs >> 48);
+                                framePkt[2] = (byte)(frameTs >> 40);
+                                framePkt[3] = (byte)(frameTs >> 32);
+                                framePkt[4] = (byte)(frameTs >> 24);
+                                framePkt[5] = (byte)(frameTs >> 16);
+                                framePkt[6] = (byte)(frameTs >> 8);
+                                framePkt[7] = (byte)(frameTs);
+                                System.arraycopy(buffer, start, framePkt, FRAME_TS_BYTES, BUFFER_SIZE);
+                                send_request(ip, framePkt, framePkt.length);
+
                                 if (count == 0) {
+                                    // Announce stream start via RTBGN, as before.
+                                    // This overwrites buffer[0..12], which overlaps
+                                    // frame 0's storage slot (buffer[10..12]) — that's
+                                    // harmless now since frame 0's audio was already
+                                    // copied out into framePkt above before this point.
                                     buffer[0]='R'; buffer[1]='T'; buffer[2]='B'; buffer[3]='G'; buffer[4]='N';
-                                    // 6~13 bytes: recordingStartTime (long, 8 bytes big-endian)
-                                    long t = System.currentTimeMillis();//recordingStartTime;
+                                    long t = System.currentTimeMillis();
                                     buffer[5]=(byte)(t>>56); buffer[6]=(byte)(t>>48);
                                     buffer[7]=(byte)(t>>40); buffer[8]=(byte)(t>>32);
                                     buffer[9]=(byte)(t>>24); buffer[10]=(byte)(t>>16);
                                     buffer[11]=(byte)(t>>8); buffer[12]=(byte)(t);
-                                    send_request(ip, buffer, 13);  // 10 → 13 bytes
-                                    //send_request(ip, buffer, 10);
-                                } else {
-                                    send_request(ip, Arrays.copyOfRange(buffer, start, end), BUFFER_SIZE);
+                                    send_request(ip, buffer, 13);
                                 }
                             }
                             count++;
@@ -417,49 +592,19 @@ public class DataRecorder {
     }
 
     // ── TCP helpers ───────────────────────────────────────────────────────────
+    //
+    // Both of these now enqueue onto the single persistent connection and
+    // return immediately, instead of opening a new Socket per call and
+    // blocking the caller's thread on network I/O. Signatures are unchanged
+    // so existing call sites elsewhere in the app keep working as-is.
 
     public void send_request(String ip, byte[] buf, int bufSize) {
-        send_request sr = new send_request();
-        sr.setIP(ip);
-        sr.setBuffer(buf, bufSize);
-        sr.execute();
+        startPersistentConnectionIfNeeded(ip);
+        enqueue(Arrays.copyOf(buf, bufSize));
     }
 
     public static void sendMsgString(String ip, String s) {
-        send_request sr = new send_request();
-        sr.setIP(ip);
-        byte[] b = s.getBytes();
-        sr.setBuffer(b, b.length);
-        sr.execute();
-    }
-}
-
-class send_request extends AsyncTask<Void, Void, String> {
-    private static final String TAG = "TCP streamer";
-    String ip;
-    byte[] buffer;
-    int bufferSize;
-
-    void setBuffer(byte[] buf, int bufSize) {
-        buffer = new byte[bufSize];
-        for (int i = 0; i < bufSize; i++) buffer[i] = buf[i];
-        bufferSize = bufSize;
-    }
-
-    void setIP(String ipIn) { ip = ipIn; }
-
-    @Override
-    protected String doInBackground(Void... voids) {
-        try {
-            Socket s = new Socket(ip, 50005);
-            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
-            out.write(buffer, 0, buffer.length);
-            out.flush();
-            out.close();
-            s.close();
-        } catch (Exception e) {
-            Log.w(TAG, "Failed to connect: " + e);
-        }
-        return null;
+        dataRecorder.startPersistentConnectionIfNeeded(ip);
+        dataRecorder.enqueue(s.getBytes());
     }
 }

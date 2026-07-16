@@ -1,7 +1,8 @@
+
 """
 unified_collector.py
 ────────────────────────────────────────────────────────────────────────────
-Galaxy Watch 7 (TCP/WiFi) + VS-BV203-B Surface Mic (TASCAM USB)
+Galaxy Watch 8 (TCP/WiFi) + Surface Mic (TASCAM USB)
 + MediaPipe-based 5-finger fingertip virtual IMU unified collector
 
 Collected data streams:
@@ -127,6 +128,20 @@ _trial_buffers = {
 _trial_queue: "queue.Queue" = queue.Queue()   # carries (start_offset, end_offset, snapshot)
 _mic_sr_runtime: int = 192000   # updated in main() to the actual mic sample rate in use
 
+# ── Pending-trial tracking ─────────────────────────────────────────────────────
+# If trials are captured faster than _trial_worker_fn can process them (e.g.
+# rapid-fire spacebar presses while collecting strokes), trials pile up in
+# _trial_queue and each one waits its turn behind the fixed per-trial grace
+# sleep. During that wait, ROLLING_RETENTION_SEC alone would keep pruning the
+# rolling buffers based on wall-clock age, and could delete samples belonging
+# to a trial that is still queued — silently truncating its IMU/watch-audio
+# portion while fingertip/mic (which aren't retention-limited) stay full
+# length. To prevent this, we track the start offset of every trial that has
+# been queued but not yet had its rolling-buffer snapshot taken, and never
+# prune past the oldest one of those, regardless of ROLLING_RETENTION_SEC.
+_pending_lock:   threading.Lock = threading.Lock()
+_pending_starts: list = []
+
 # ── IMU / watch-audio rolling buffers ──────────────────────────────────────────
 # Watch IMU/audio are transmitted in network batches and always arrive with some
 # delay. Gating them purely by _trial_active would silently drop samples that
@@ -135,13 +150,20 @@ _mic_sr_runtime: int = 192000   # updated in main() to the actual mic sample rat
 # these streams are buffered continuously regardless of touch state, and after
 # touch_up we wait out a grace period before extracting the [trial_start,
 # trial_end] window from the rolling buffer.
-ROLLING_RETENTION_SEC = 5.0    # rolling buffer entries older than this are discarded (bounds memory growth)
+#
+# If trials are queued faster than the worker can process them, pruning by
+# ROLLING_RETENTION_SEC alone could delete a still-pending trial's data before
+# its snapshot is taken. See _pending_trial_starts / _rolling_cutoff() below
+# for the mechanism that prevents this.
+ROLLING_RETENTION_SEC = 30.0   # hard upper bound on rolling buffer age (safety net against unbounded memory growth).
+                                # This alone is NOT what protects trial data from being dropped when the worker
+                                # falls behind — see _pending_trial_starts below, which is the real guard.
 IMU_GRACE_SEC         = 0.5    # time to wait after touch_up for pending IMU batches to arrive (sec)
 WATCH_AUDIO_GRACE_SEC = 0.5    # time to wait after touch_up for pending watch-audio batches to arrive (sec)
 
 _rolling_lock: threading.Lock = threading.Lock()
 _imu_rolling:         "deque" = deque()   # (ts, sensor, v1, v2, v3, watch_ts_ms)
-_watch_audio_rolling: "deque" = deque()   # (ts, raw_bytes)
+_watch_audio_rolling: "deque" = deque()   # (ts, raw_bytes, watch_ts_ms)
 
 # Live trial-saving configuration — updated from CLI args in main()
 _trial_label:        str  = ''            # class label being repeated in this session (reuses --label)
@@ -179,6 +201,19 @@ def _offset() -> float:
 
 def _log(tag: str, msg: str):
     print(f'\n[{_offset():8.3f}s][{tag}] {msg}')
+
+
+def _rolling_cutoff(now_ts: float) -> float:
+    """Returns the timestamp before which rolling-buffer entries may be
+    discarded. Normally this is just `now_ts - ROLLING_RETENTION_SEC`, but if
+    a trial is still queued/awaiting its rolling-buffer snapshot, the cutoff
+    is clamped to that trial's start so its data can't be pruned out from
+    under it."""
+    age_based_cutoff = now_ts - ROLLING_RETENTION_SEC
+    with _pending_lock:
+        if _pending_starts:
+            return min(age_based_cutoff, min(_pending_starts))
+    return age_based_cutoff
 
 
 # ─── Session management ─────────────────────────────────────────────────────────
@@ -271,12 +306,48 @@ def close_session():
                   'fingertip_imu_offset_sec',
                   'rtbgn_watch_ms', 'rtbgn_pc_sec', 'rtend_watch_ms', 'rtend_pc_sec'):
             print(f'  {k} = {_sync.get(k)}')
+        _check_watch_connection_quality()
+
+
+def _check_watch_connection_quality():
+    """Compares elapsed time on the watch's own clock (RTBGN→RTEND) against
+    elapsed time on the PC clock over the same interval. A large discrepancy
+    means the watch connection stalled or throttled at some point during the
+    session (WiFi drop, screen/app going to sleep, etc.), which can leave
+    trial-level crops looking misaligned even though this fix pads gaps as
+    they're detected. This is a diagnostic warning only — it does not affect
+    what gets saved."""
+    rtbgn_watch_ms = _sync.get('rtbgn_watch_ms')
+    rtbgn_pc_sec   = _sync.get('rtbgn_pc_sec')
+    rtend_watch_ms = _sync.get('rtend_watch_ms')
+    rtend_pc_sec   = _sync.get('rtend_pc_sec')
+    if not (rtbgn_watch_ms and rtbgn_pc_sec and rtend_watch_ms and rtend_pc_sec):
+        return
+
+    watch_elapsed = (rtend_watch_ms - rtbgn_watch_ms) / 1000.0
+    pc_elapsed    = rtend_pc_sec - rtbgn_pc_sec
+    if pc_elapsed <= 0:
+        return
+
+    ratio = watch_elapsed / pc_elapsed
+    print(f'[QUALITY] watch-clock elapsed={watch_elapsed:.2f}s  PC-clock elapsed={pc_elapsed:.2f}s  ratio={ratio:.2%}')
+    if ratio < 0.95:
+        print(f'[QUALITY] WARNING: watch connection may have stalled during this session '
+              f'(only {ratio:.1%} of real time accounted for on the watch clock). '
+              f'Consider re-collecting this session.')
 
 
 # ─── Watch audio writer ─────────────────────────────────────────────────────────
-def _write_watch_audio(raw_bytes: bytes):
+def _write_watch_audio(raw_bytes: bytes, watch_ts_ms: float | None = None):
+    """watch_ts_ms is this frame's own capture timestamp (System.currentTimeMillis()
+    on the watch), sent as an 8-byte prefix per frame. It's stored as-is here,
+    exactly like IMU's watch_ts_ms — the RTBGN-based conversion to PC time
+    happens later, at trial-crop time in process_trial(), once RTBGN is known
+    to have been received. If watch_ts_ms is unavailable (e.g. a legacy
+    packet without the timestamp prefix), it's left as None and trial
+    cropping falls back to this frame's PC arrival time."""
     global _watch_audio_offset, _watch_rms
-    ts = _offset()
+    ts = _offset()   # PC arrival time — used only for the session-level offset display and as a fallback
     samples    = np.frombuffer(raw_bytes, dtype='<i2').astype(np.float32)
     _watch_rms = float(np.sqrt(np.mean(samples ** 2)))
     with _lock:
@@ -288,8 +359,8 @@ def _write_watch_audio(raw_bytes: bytes):
         _watch_wf.writeframes(raw_bytes)
 
     with _rolling_lock:   # rolling buffer is filled regardless of touch state
-        _watch_audio_rolling.append((ts, raw_bytes))
-        cutoff = ts - ROLLING_RETENTION_SEC
+        _watch_audio_rolling.append((ts, raw_bytes, watch_ts_ms))
+        cutoff = _rolling_cutoff(ts)
         while _watch_audio_rolling and _watch_audio_rolling[0][0] < cutoff:
             _watch_audio_rolling.popleft()
 
@@ -315,7 +386,7 @@ def _write_imu(sensor: str, v1: float, v2: float, v3: float, watch_ts_ms: float 
 
     with _rolling_lock:   # rolling buffer is filled regardless of touch state
         _imu_rolling.append((ts, sensor, v1, v2, v3, watch_ts_ms))
-        cutoff = ts - ROLLING_RETENTION_SEC
+        cutoff = _rolling_cutoff(ts)
         while _imu_rolling and _imu_rolling[0][0] < cutoff:
             _imu_rolling.popleft()
 
@@ -391,6 +462,8 @@ def _on_key_release(key):
             snapshot = {k: list(v) for k, v in _trial_buffers.items()}
         _write_event('touch_up')
         if start is not None:
+            with _pending_lock:
+                _pending_starts.append(start)
             _trial_queue.put((start, end, snapshot))
     elif key == keyboard.Key.esc:
         stop_event.set()
@@ -423,6 +496,10 @@ def _trial_worker_fn():
         with _rolling_lock:
             snapshot['imu']         = list(_imu_rolling)
             snapshot['watch_audio'] = list(_watch_audio_rolling)
+
+        with _pending_lock:   # this trial's data is now safely copied out; stop protecting it
+            if start in _pending_starts:
+                _pending_starts.remove(start)
 
         try:
             process_trial(start, end, snapshot)
@@ -479,10 +556,22 @@ def process_trial(start: float, end: float, snapshot: dict):
         _log('TRIAL', 'no valid samples remain after applying margin, skipping')
         return
 
-    # Watch audio: concatenate only the blocks within the margin range (block-level crop, not sample-accurate)
-    wa_bytes = b''.join(
-        chunk for (ts, chunk) in snapshot['watch_audio'] if trial_start <= ts <= trial_end
-    )
+    # Watch audio: align each frame via the same RTBGN mapping as IMU (using
+    # its own per-frame watch_ts_ms), not by PC arrival order. Each frame is
+    # sent over its own TCP connection, so arrival order can differ from
+    # capture order under network jitter — sorting by aligned time corrects
+    # for that, the same way it wouldn't be needed if frames shared one
+    # ordered connection.
+    wa_frames = []
+    for (ts, chunk, watch_ts_ms) in snapshot['watch_audio']:
+        if use_rtbgn and watch_ts_ms:
+            aligned_pc = (watch_ts_ms - rtbgn_watch_ms) / 1000.0 + rtbgn_pc_sec
+        else:
+            aligned_pc = ts   # fall back to PC-arrival time if RTBGN/watch_ts_ms is unavailable
+        if trial_start <= aligned_pc <= trial_end:
+            wa_frames.append((aligned_pc, chunk))
+    wa_frames.sort(key=lambda item: item[0])
+    wa_bytes = b''.join(chunk for _, chunk in wa_frames)
     wa_samples = np.frombuffer(wa_bytes, dtype='<i2') if wa_bytes else np.array([], dtype=np.int16)
 
     # Surface mic: concatenate blocks within the margin range and resample to the watch audio sample rate
@@ -498,7 +587,7 @@ def process_trial(start: float, end: float, snapshot: dict):
             mic_rs = mic_concat
     else:
         mic_rs = np.array([], dtype=np.float64)
-    mic_int16 = np.clip(mic_rs, -32768, 32767).astype(np.int16)
+    mic_int16 = np.clip(mic_rs * 32767, -32768, 32767).astype(np.int16)
 
     # ── Determine trial folder (same incremental numbering as segment_trials.py) ──
     label     = _trial_label if _trial_label else 'unlabeled'
@@ -667,11 +756,111 @@ def _camera_thread_fn(camera_index: int, show_window: bool,
 
 
 # ─── TCP net thread ───────────────────────────────────────────────────────────────
+def _recv_exact(conn: socket.socket, n: int) -> bytes | None:
+    """Reads exactly n bytes from conn, tolerating recv() timeouts by simply
+    retrying (so a slow trickle of bytes doesn't lose partially-read data the
+    way restarting the read from scratch would). Returns None if the
+    connection was closed before n bytes arrived, or if shutdown was
+    requested mid-read."""
+    buf = bytearray()
+    while len(buf) < n:
+        if stop_event.is_set():
+            return None
+        try:
+            chunk = conn.recv(n - len(buf))
+        except socket.timeout:
+            continue
+        if not chunk:
+            return None   # connection closed
+        buf.extend(chunk)
+    return bytes(buf)
+
+
+def _dispatch_watch_packet(pkt: bytes):
+    """Same message dispatch logic as before the persistent-connection
+    change — now called once per length-prefixed frame read off the
+    connection, instead of once per one-shot TCP connection."""
+    total = len(pkt)
+
+    # New protocol: every audio frame is [8-byte big-endian watch_ts_ms]
+    # + [WATCH_BUF_SIZE bytes of PCM audio]. This includes frame 0, which
+    # used to be dropped (only its RTBGN header was sent).
+    if total == WATCH_BUF_SIZE + 8:
+        watch_ts_ms = int.from_bytes(pkt[:8], byteorder='big', signed=False)
+        _write_watch_audio(pkt[8:], watch_ts_ms)
+        return
+
+    # Legacy fallback: a bare audio frame with no timestamp prefix at all
+    # (older watch-side builds). Falls back to PC arrival time for
+    # trial-crop alignment.
+    if total == WATCH_BUF_SIZE:
+        _write_watch_audio(pkt)
+        return
+
+    try:
+        hdr = pkt[:5].decode('utf-8', errors='ignore')
+    except Exception:
+        return
+
+    if hdr == 'SUBID':
+        _log('NET', f'SUBID  {pkt[6:10].decode("utf-8", errors="ignore").strip()}')
+
+    elif hdr == 'RTBGN':
+        pc_sec = _offset()
+        if len(pkt) >= 13:
+            watch_ms = int.from_bytes(pkt[5:13], byteorder='big', signed=False)
+            with _lock:
+                _sync['rtbgn_watch_ms'] = watch_ms
+                _sync['rtbgn_pc_sec']   = pc_sec
+            _log('NET', f'RTBGN  watch_ms={watch_ms}  pc_sec={pc_sec:.4f}s')
+        else:
+            _log('NET', 'RTBGN (no timestamp — watch-side code needs updating)')
+
+    elif hdr == 'RTEND':
+        global _watch_wf
+        pc_sec = _offset()
+        if len(pkt) >= 13:
+            watch_ms = int.from_bytes(pkt[5:13], byteorder='big', signed=False)
+            with _lock:
+                _sync['rtend_watch_ms'] = watch_ms
+                _sync['rtend_pc_sec']   = pc_sec
+            _log('NET', f'RTEND  watch_ms={watch_ms}  pc_sec={pc_sec:.4f}s')
+        # Stop writing watch audio after RTEND
+        if _watch_wf:
+            _watch_wf.close()
+            _watch_wf = None
+
+    elif hdr == 'SOUND':
+        # Legacy non-realtime full-session dump: header + id, no per-frame
+        # timestamp. Falls back to PC arrival time for trial-crop alignment.
+        raw = pkt[10:]
+        buf = np.frombuffer(raw[:len(raw)//2*2], dtype='<i2')
+        _write_watch_audio(buf.tobytes())
+        _log('NET', f'SOUND  {len(buf)} samples')
+
+    elif hdr == 'IMUAC':
+        n = _parse_imu_packet(pkt, 'acc')
+        if n:
+            _log('NET', f'IMUAC  {n} samples')
+
+    elif hdr == 'IMUGY':
+        n = _parse_imu_packet(pkt, 'gyro')
+        if n:
+            _log('NET', f'IMUGY  {n} samples')
+
+    elif total > 0 and total % 2 == 0:
+        _write_watch_audio(pkt)
+
+
 def _net_thread_fn():
+    # Backlog raised from 5 → 16: mostly academic now that the watch keeps a
+    # single long-lived connection open (see DataRecorder.java's persistent
+    # connection), but it costs nothing and gives more headroom if the watch
+    # ever needs to reconnect in a burst.
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((WATCH_HOST, WATCH_PORT))
-    srv.listen(5)
+    srv.listen(16)
     srv.settimeout(1.0)
 
     try:
@@ -685,7 +874,7 @@ def _net_thread_fn():
 
     while not stop_event.is_set():
         try:
-            conn, _ = srv.accept()
+            conn, addr = srv.accept()
         except socket.timeout:
             continue
         except Exception as e:
@@ -693,82 +882,31 @@ def _net_thread_fn():
                 _log('NET', f'accept error: {e}')
             continue
 
-        conn.settimeout(0.15)
-        chunks = []
+        _log('NET', f'watch connected from {addr}')
+        conn.settimeout(1.0)   # bounds how long a single recv() blocks, so shutdown/reconnect stays responsive
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         try:
-            while True:
-                d = conn.recv(65536)
-                if not d:
+            while not stop_event.is_set():
+                header = _recv_exact(conn, 4)
+                if header is None:
+                    break   # watch closed the connection (or shutdown requested)
+
+                msg_len = int.from_bytes(header, byteorder='big', signed=False)
+                if msg_len <= 0 or msg_len > 10_000_000:
+                    _log('NET', f'implausible message length {msg_len}, dropping connection')
                     break
-                chunks.append(d)
-        except socket.timeout:
-            pass
-        except Exception:
-            pass
+
+                payload = _recv_exact(conn, msg_len)
+                if payload is None:
+                    break
+
+                _dispatch_watch_packet(payload)
+        except Exception as e:
+            _log('NET', f'connection error: {e}')
         finally:
             conn.close()
-
-        if not chunks:
-            continue
-
-        pkt   = b''.join(chunks)
-        total = len(pkt)
-
-        if total == WATCH_BUF_SIZE:
-            _write_watch_audio(pkt)
-            continue
-
-        try:
-            hdr = pkt[:5].decode('utf-8', errors='ignore')
-        except Exception:
-            continue
-
-        if hdr == 'SUBID':
-            _log('NET', f'SUBID  {pkt[6:10].decode("utf-8", errors="ignore").strip()}')
-
-        elif hdr == 'RTBGN':
-            pc_sec = _offset()
-            if len(pkt) >= 13:
-                watch_ms = int.from_bytes(pkt[5:13], byteorder='big', signed=False)
-                with _lock:
-                    _sync['rtbgn_watch_ms'] = watch_ms
-                    _sync['rtbgn_pc_sec']   = pc_sec
-                _log('NET', f'RTBGN  watch_ms={watch_ms}  pc_sec={pc_sec:.4f}s')
-            else:
-                _log('NET', 'RTBGN (no timestamp — watch-side code needs updating)')
-
-        elif hdr == 'RTEND':
-            pc_sec = _offset()
-            if len(pkt) >= 13:
-                watch_ms = int.from_bytes(pkt[5:13], byteorder='big', signed=False)
-                with _lock:
-                    _sync['rtend_watch_ms'] = watch_ms
-                    _sync['rtend_pc_sec']   = pc_sec
-                _log('NET', f'RTEND  watch_ms={watch_ms}  pc_sec={pc_sec:.4f}s')
-            # Stop writing watch audio after RTEND
-            global _watch_wf
-            if _watch_wf:
-                _watch_wf.close()
-                _watch_wf = None
-
-        elif hdr == 'SOUND':
-            raw = pkt[10:]
-            buf = np.frombuffer(raw[:len(raw)//2*2], dtype='<i2')
-            _write_watch_audio(buf.tobytes())
-            _log('NET', f'SOUND  {len(buf)} samples')
-
-        elif hdr == 'IMUAC':
-            n = _parse_imu_packet(pkt, 'acc')
-            if n:
-                _log('NET', f'IMUAC  {n} samples')
-
-        elif hdr == 'IMUGY':
-            n = _parse_imu_packet(pkt, 'gyro')
-            if n:
-                _log('NET', f'IMUGY  {n} samples')
-
-        elif total > 0 and total % 2 == 0:
-            _write_watch_audio(pkt)
+            _log('NET', 'watch disconnected — waiting for reconnect')
 
     srv.close()
     _log('NET', 'stopped')
