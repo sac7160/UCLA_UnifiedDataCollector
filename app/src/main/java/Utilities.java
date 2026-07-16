@@ -5,7 +5,7 @@ import android.os.Build;
 import androidx.annotation.RequiresApi;
 
 public class Utilities {
-    static public String IP = "192.168.0.110";
+    static public String IP = "192.168.0.163";
     static public String SUB_ID = "0";
 
     static public int RecordingTime = 30;

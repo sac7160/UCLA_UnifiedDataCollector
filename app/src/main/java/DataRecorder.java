@@ -1,234 +1,3 @@
-//// (c) 2025, KAIST, WIT_LAB, Jiwan Kim (jiwankim@kaist.ac.kr, kjwan4435@gmail.com)
-// 2026 KAIST, HCITECH LAB, Chanhyeon Park modifed
-//
-//import android.annotation.SuppressLint;
-//import android.media.AudioFormat;
-//import android.media.AudioRecord;
-//import android.media.MediaRecorder;
-//import android.media.audiofx.AcousticEchoCanceler;
-//import android.media.audiofx.AutomaticGainControl;
-//import android.media.audiofx.NoiseSuppressor;
-//import android.os.AsyncTask;
-//import android.util.Log;
-//
-//import java.io.BufferedOutputStream;
-//import java.io.DataOutputStream;
-//import java.net.Socket;
-//import java.util.Arrays;
-//
-//public class DataRecorder {
-//
-//    // LLAP
-//    public static final int  AUDIO_SAMPLE_RATE = Utilities.SamplingRate;         // Record sample rate
-//    public static final int MAX_FRAME_SIZE = Utilities.SamplingRate/25;          // Number of frame size
-//    private static final String TAG = "Data Recorder";
-//
-//    // Recorder
-//    public static DataRecorder dataRecorder = new DataRecorder();
-//    static int device                       = MediaRecorder.AudioSource.UNPROCESSED;
-//    private static final int CHANNEL        = AudioFormat.CHANNEL_IN_MONO;      // use stereo to get top and bottom mics (one/channel)
-//    private static final int FORMAT         = AudioFormat.ENCODING_PCM_16BIT;   // standard encoding
-//    private static final int RECORDING_RATE = Utilities.SamplingRate;           // DVD quality (max)
-//    private AudioRecord recorder;
-//
-//
-//    // the start and stop times
-//    long recordingStartTime;
-//    long recordingStopTime;
-//
-//    // the minimum buffer size needed for audio recording - 7680 for 48000, STEREO(2), PCM_16BIT, or 1/25 of a second (40ms).
-//    private int BUFFER_SIZE = AudioRecord.getMinBufferSize(RECORDING_RATE, CHANNEL, FORMAT);
-//
-//    // are we currently sending audio data
-//    boolean currentlyRecordingAudio = false;
-//
-//    boolean sendMsg;
-//
-//    public void startStreamingAudio(String ip, int duration, int id) {
-//        currentlyRecordingAudio = true;
-//        sendMsg = true;// be default we send the message
-//        startStreaming(ip, duration, id);
-//    }
-//
-//    public void stopStreamingAudio() {
-//        stopStreamingAudio(true);
-//    }
-//
-//    private void stopStreamingAudio(boolean sendMsgIn) {
-//        sendMsg = sendMsgIn;
-//        currentlyRecordingAudio = false;
-//    }
-//    private void startStreaming(final String ip, final int duration, final int id) {
-//
-//        recordingStartTime = recordingStopTime = -1; // blank it.
-//        Thread streamThread = new Thread(new Runnable() {
-//
-//            @SuppressLint("MissingPermission")
-//            @Override
-//            public void run() {
-//                BUFFER_SIZE = MAX_FRAME_SIZE * 2;
-//                int maxPackets = duration * (AUDIO_SAMPLE_RATE / MAX_FRAME_SIZE);
-//                Log.w(TAG, "Log/ maxPackets: " + maxPackets);
-//
-//                int extraBytes = 10;
-//                byte[] buffer = new byte[extraBytes + (BUFFER_SIZE * maxPackets)];
-//
-//
-//                // make the header for the sound file
-//                buffer[0] = 'S';
-//                buffer[1] = 'O';
-//                buffer[2] = 'U';
-//                buffer[3] = 'N';
-//                buffer[4] = 'D';
-//                byte[] num = Utilities.leftPad(Integer.toString(id), 5).getBytes();
-//                buffer[5] = num[0];
-//                buffer[6] = num[1];
-//                buffer[7] = num[2];
-//                buffer[8] = num[3];
-//                buffer[9] = num[4];
-//
-//                int count = 0;
-//
-//                try {
-//                    recorder = new AudioRecord(device, RECORDING_RATE, CHANNEL, FORMAT, BUFFER_SIZE);
-//                    int sessionId = recorder.getAudioSessionId();
-//
-//                    if (NoiseSuppressor.isAvailable()) {
-//                        NoiseSuppressor noiseSuppressor = NoiseSuppressor.create(sessionId);
-//                        noiseSuppressor.setEnabled(false);  // Disable noise reduction
-//                    }
-//
-//                    if (AutomaticGainControl.isAvailable()) {
-//                        AutomaticGainControl agc = AutomaticGainControl.create(sessionId);
-//                        agc.setEnabled(false);  // Disable auto gain
-//                    }
-//
-//                    if (AcousticEchoCanceler.isAvailable()) {
-//                        AcousticEchoCanceler echoCanceler = AcousticEchoCanceler.create(sessionId);
-//                        echoCanceler.setEnabled(false);  // Disable echo cancellation
-//                    }
-//
-//                    recorder.startRecording();
-//                    recordingStartTime = System.currentTimeMillis();
-////                    startTrial(recordingStartTime);
-//                    Log.w(TAG, "Log/ " + "Blocks: " + Utilities.BlockCounter + " / TrialNumber, EndCounter: " + Utilities.TrialCounter + ", " + Utilities.TrialEndCounter);
-//                    Log.w(TAG, "Log/ maxPackets: " + maxPackets);
-//
-//                    while (currentlyRecordingAudio) {
-//                        int read = recorder.read(buffer, extraBytes + (BUFFER_SIZE*count), BUFFER_SIZE);
-//
-//                        if (count==maxPackets) {
-//                            if (Utilities.IsRealtimeStreaming) {
-//                                // make the header for the sound file
-//                                buffer[0] = 'R';
-//                                buffer[1] = 'T';
-//                                buffer[2] = 'E';
-//                                buffer[3] = 'N';
-//                                buffer[4] = 'D';
-//                                send_request(ip, buffer, 10);
-//                            }
-//                            currentlyRecordingAudio = false;
-//                        }
-//                        else {
-//                            if (Utilities.IsRealtimeStreaming) {
-//                                int start = extraBytes + (BUFFER_SIZE*count);
-//                                int end = start + BUFFER_SIZE;
-//                                if (count == 0) {
-//                                    buffer[0] = 'R';
-//                                    buffer[1] = 'T';
-//                                    buffer[2] = 'B';
-//                                    buffer[3] = 'G';
-//                                    buffer[4] = 'N';
-//                                    send_request(ip, buffer, 10);
-//                                } else {
-//                                    byte[] packet = Arrays.copyOfRange(buffer, start, end);
-//                                    send_request(ip, packet, BUFFER_SIZE);
-//                                }
-//                            }
-//                            count++;
-//                        }
-//                    }
-//                    recordingStopTime = System.currentTimeMillis(); // not reading after this point, so should be fairly accurate....
-//                    Log.w(TAG, "Log/ Recording Start Time: " + recordingStartTime + " / Recording Stop Time: " + recordingStopTime);
-//                }
-//                catch (Exception e) {
-//                    Log.w(TAG, "Log/ TCP Streamer Exception: " + e);
-//                }
-//                recorder.stop();
-//
-//                if (sendMsg && !Utilities.IsRealtimeStreaming)
-//                    send_request(ip, buffer, extraBytes + (BUFFER_SIZE*count)); // if this always going to be correct? Will count vary? Are we chopping off the end here?
-//                recorder.release();
-//            }
-//        }
-//        );
-//
-//        // start the thread
-//        streamThread.start();
-//    }
-//
-//    public void send_request(String ip, byte[] buf, int bufSize) {
-//        send_request sr = new send_request();
-//        sr.setIP(ip);
-//        sr.setBuffer(buf, bufSize);
-//        sr.execute();
-//    }
-//
-//    public static void sendMsgString(String ip, String s) {
-//        send_request sr = new send_request();
-//        sr.setIP(ip);
-//        byte[] b = s.getBytes();
-//        sr.setBuffer(b, b.length);
-//        Log.w(TAG, "BUFFER SENT: " + b + ", " + b.length);
-//        sr.execute();
-//    }
-//
-//
-//}
-//
-//class send_request extends AsyncTask<Void, Void, String> {
-//    private static final String TAG = "TCP streamer";
-//
-//    String ip;
-//    byte[] buffer;
-//    int bufferSize;
-//
-//    void setBuffer(byte[] buf, int bufSize)
-//    {
-//        buffer = new byte[bufSize];
-//        for (int i=0; i<bufSize; i++)
-//            buffer[i] = buf[i]; // make a local copy.
-//        bufferSize = bufSize;
-//    }
-//
-//    void setIP(String ipIn) {ip = ipIn;}
-//
-//    // doInBackground: task for threading
-//    @Override
-//    protected String doInBackground(Void... voids) {
-//        try {
-//            Log.w(TAG, "Trying to send: " + buffer.length + " bytes");
-//            Socket s = new Socket(ip, 50005);
-//            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(s.getOutputStream()));
-//            out.write(buffer, 0, buffer.length); // this sends the write data out
-//            out.flush();
-//            Log.w(TAG, "Succeed to send: "+ out.size() + "bytes");
-//            out.close();
-//            s.close(); // this causes some problem?
-//        }
-//        catch (Exception e) {
-//            Log.w(TAG, "Failed to connect: " + e);
-//        }
-//        return null;
-//    }
-//}
-
-
-// (c) 2025, KAIST, WIT_LAB, Jiwan Kim (jiwankim@kaist.ac.kr, kjwan4435@gmail.com)
-// Modified: IMU real-time streaming added
-// 2026 KAIST, HCITECH LAB, Chanhyeon Park modifed
-
-
 import android.annotation.SuppressLint;
 import android.media.AudioFormat;
 import android.media.AudioRecord;
@@ -328,6 +97,35 @@ public class DataRecorder {
         writerThread.start();
     }
 
+    /**
+     * Blocks (up to timeoutMs) until the persistent connection is actually
+     * established. Used before starting audio capture so that RTBGN's
+     * timestamp — captured right as frame 0 is read — doesn't get sent out
+     * only after an initial TCP handshake delay of up to CONNECT_TIMEOUT_MS.
+     * Without this, rtbgn_watch_ms (captured pre-connection) and
+     * rtbgn_pc_sec (captured on arrival, post-connection) end up biased by
+     * however long the first connect() took — which showed up as a fixed
+     * ~1s (== CONNECT_TIMEOUT_MS) offset across an entire session's worth of
+     * watch_ts_ms → PC-time alignment.
+     */
+    private boolean waitForConnection(long timeoutMs) {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            if (persistentSocket != null && persistentSocket.isConnected() && !persistentSocket.isClosed()) {
+                return true;
+            }
+            try {
+                Thread.sleep(10);
+            } catch (InterruptedException ignored) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        Log.w(TAG, "waitForConnection timed out after " + timeoutMs + "ms — proceeding anyway "
+                + "(RTBGN alignment may be off for this session)");
+        return false;
+    }
+
     /** Call when the whole recording session is done, to close the
      * connection after any remaining queued messages have drained. */
     public void closeConnection() {
@@ -386,6 +184,15 @@ public class DataRecorder {
 
     private void writerLoop() {
         while (writerRunning || !sendQueue.isEmpty()) {
+            // Try to connect eagerly, independent of whether a message is
+            // waiting — this is what lets waitForConnection() (called before
+            // recording starts) actually observe a connected socket, instead
+            // of the connection only being attempted once the first message
+            // happens to be enqueued.
+            if (!ensureConnected()) {
+                continue;   // ensureConnected() already backed off briefly on failure
+            }
+
             byte[] msg;
             try {
                 msg = sendQueue.poll(200, TimeUnit.MILLISECONDS);
@@ -395,12 +202,6 @@ public class DataRecorder {
             }
             if (msg == null) continue;
 
-            if (!ensureConnected()) {
-                // Couldn't (re)connect within CONNECT_TIMEOUT_MS — drop this
-                // one message and move on to the next, rather than blocking
-                // everything behind it the way the old per-message sockets did.
-                continue;
-            }
             try {
                 // 4-byte big-endian length prefix, then the raw message —
                 // lets the PC side split messages apart on a long-lived
@@ -470,6 +271,15 @@ public class DataRecorder {
                     if (AcousticEchoCanceler.isAvailable())
                         AcousticEchoCanceler.create(sessionId).setEnabled(false);
 
+                    // Wait here (on this background thread, not the caller's)
+                    // for the persistent connection to actually be up before
+                    // recording starts. Otherwise RTBGN's timestamp — taken
+                    // right as frame 0 is captured — gets sent only after an
+                    // initial TCP handshake delay of up to CONNECT_TIMEOUT_MS,
+                    // biasing the entire session's watch_ts_ms → PC-time
+                    // alignment by however long that handshake took.
+                    waitForConnection(2000);
+
                     recorder.startRecording();
                     recordingStartTime = System.currentTimeMillis();
                     Log.w(TAG, "Log/ maxPackets: " + maxPackets);
@@ -477,20 +287,32 @@ public class DataRecorder {
                     while (currentlyRecordingAudio) {
                         int start = extraBytes + (BUFFER_SIZE * count);
                         int read = recorder.read(buffer, start, BUFFER_SIZE);
-                        // Capture time for this specific frame, taken right after
-                        // the blocking read returns. Same clock
-                        // (System.currentTimeMillis()) as RTBGN/RTEND, so the PC
-                        // side can map it through the same rtbgn_watch_ms ↔
-                        // rtbgn_pc_sec reference already used for IMU. This no
-                        // longer depends on send_request() completing quickly,
-                        // since send_request() now just enqueues and returns
-                        // immediately (see below) — the capture loop itself is
-                        // no longer at the mercy of network timing.
+                        // Plain real-time measurement, with NO fixed
+                        // correction applied. Two different correction
+                        // attempts were tried here (a pure count*duration
+                        // calculation, and subtracting one frameDurationMs
+                        // from this reading) and both empirically made
+                        // alignment worse than this plain version — meaning
+                        // the true relationship between this reading and the
+                        // frame's actual capture time isn't a simple,
+                        // guessable constant. Fix this only based on an
+                        // actual measurement (e.g. logging both a
+                        // pre-read() and post-read() timestamp across many
+                        // frames to see how read() latency really behaves
+                        // on this device), not another assumption.
                         long frameTs = System.currentTimeMillis();
 
                         if (count == maxPackets) {
                             if (Utilities.IsRealtimeStreaming) {
                                 buffer[0]='R'; buffer[1]='T'; buffer[2]='E'; buffer[3]='N'; buffer[4]='D';
+                                // Unlike frame timestamps above, this reads the
+                                // real wall clock on purpose: RTEND's whole
+                                // job is to measure how much real time has
+                                // actually elapsed, so the PC side can compare
+                                // it against RTBGN and correct for any drift
+                                // between the nominal audio-clock timeline and
+                                // real time (see _recalibrate_session_trials
+                                // on the PC side).
                                 long t = System.currentTimeMillis();    //for sync with surface microphone
                                 buffer[5]=(byte)(t>>56); buffer[6]=(byte)(t>>48);
                                 buffer[7]=(byte)(t>>40); buffer[8]=(byte)(t>>32);
@@ -527,8 +349,14 @@ public class DataRecorder {
                                     // frame 0's storage slot (buffer[10..12]) — that's
                                     // harmless now since frame 0's audio was already
                                     // copied out into framePkt above before this point.
+                                    //
+                                    // Reuses this iteration's frameTs (not a
+                                    // fresh System.currentTimeMillis() call)
+                                    // so RTBGN's watch_ms is exactly identical
+                                    // to frame 0's own timestamp — both are
+                                    // the same corrected real-time reading.
                                     buffer[0]='R'; buffer[1]='T'; buffer[2]='B'; buffer[3]='G'; buffer[4]='N';
-                                    long t = System.currentTimeMillis();
+                                    long t = frameTs;
                                     buffer[5]=(byte)(t>>56); buffer[6]=(byte)(t>>48);
                                     buffer[7]=(byte)(t>>40); buffer[8]=(byte)(t>>32);
                                     buffer[9]=(byte)(t>>24); buffer[10]=(byte)(t>>16);

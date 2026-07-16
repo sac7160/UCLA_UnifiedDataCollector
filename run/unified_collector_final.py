@@ -1,8 +1,7 @@
-
 """
 unified_collector.py
 ────────────────────────────────────────────────────────────────────────────
-Galaxy Watch 8 (TCP/WiFi) + Surface Mic (TASCAM USB)
+Galaxy Watch 7 (TCP/WiFi) + VS-BV203-B Surface Mic (TASCAM USB)
 + MediaPipe-based 5-finger fingertip virtual IMU unified collector
 
 Collected data streams:
@@ -44,6 +43,7 @@ Usage:
 import argparse
 import csv
 import json
+import multiprocessing as mp
 import queue
 import signal
 import socket
@@ -63,7 +63,9 @@ import scipy.io.wavfile as wavfile
 from pynput import keyboard
 from scipy.signal import butter, sosfilt, sosfilt_zi, resample_poly
 
-from fingertip_imu_multi import MultiFingertipIMUTracker, gravity_vector_from_camera_tilt
+# Note: MultiFingertipIMUTracker / gravity_vector_from_camera_tilt are
+# imported inside _camera_process_fn instead of here, since that code now
+# runs in a separate process (see the comment above that function).
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 WATCH_HOST       = '0.0.0.0'
@@ -71,6 +73,20 @@ WATCH_PORT       = 50005
 WATCH_AUDIO_SR   = 48000
 WATCH_FRAME_SIZE = WATCH_AUDIO_SR // 25   # 1920 samples
 WATCH_BUF_SIZE   = WATCH_FRAME_SIZE * 2   # 3840 bytes
+
+# The watch only timestamps an audio frame once recorder.read() returns,
+# which happens after the full ~40ms frame has already been buffered by the
+# hardware — so every watch-audio frame's watch_ts_ms is systematically late
+# relative to when its audio was actually captured. This can't be fixed on
+# the watch side by shifting individual frame timestamps (that cancels out
+# against RTBGN, which is timestamped the same way — see the conversation
+# that worked this out). Instead it's corrected here, once, after the
+# RTBGN-based watch-clock → PC-time mapping. Empirically measured at
+# ~30-70ms across sessions (via plot_audio_sync.py's onset comparison against
+# surface_mic, which has no such buffering delay). Only applies to watch
+# audio — IMU samples are each timestamped individually on the watch side and
+# don't have this frame-buffering artifact.
+WATCH_AUDIO_LATENCY_SEC = 0.045
 
 MIC_SR           = 192000
 MIC_CHANNELS     = 4
@@ -101,13 +117,22 @@ _imu_flush_n = 0
 _cam_fp      = None   # fingertip_imu.csv file handle
 _cam_writer  = None
 _cam_flush_n = 0
-_cam_cap     = None    # cv2.VideoCapture
-_cam_tracker = None    # MultiFingertipIMUTracker
-_display_queue: "queue.Queue" = queue.Queue(maxsize=1)   # macOS: imshow must run on the main thread
+# Note: the camera + MediaPipe tracker no longer live in this process at all
+# (see _camera_process_fn) — there's nothing to hold a reference to here.
 
 _events_fp     = None   # events.csv file handle for spacebar down/up marking
 _events_writer = None
 _space_down    = False  # guards against key auto-repeat firing multiple events
+
+# Per-frame watch-audio index (session-level), used only for post-session
+# recalibration once RTEND is known — see _recalibrate_session_trials().
+# Records where each frame landed in watch_audio.wav (by sample offset) and
+# its own watch_ts_ms, so trials can be re-cropped later with a corrected
+# two-point (RTBGN+RTEND) time mapping instead of the single-point mapping
+# available live.
+_watch_audio_frames_fp:     None = None
+_watch_audio_frames_writer: None = None
+_watch_audio_session_samples: int = 0
 
 # ─── Live trial buffering ──────────────────────────────────────────────────────
 # While touch_down~touch_up is active, each stream's samples are also buffered
@@ -222,6 +247,7 @@ def start_session(label: str = '') -> Path:
     global _watch_wf, _mic_wf, _imu_fp, _imu_writer
     global _cam_fp, _cam_writer
     global _events_fp, _events_writer
+    global _watch_audio_frames_fp, _watch_audio_frames_writer, _watch_audio_session_samples
     global _watch_audio_offset, _mic_offset, _imu_offset, _cam_offset, _sync
 
     ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -260,6 +286,12 @@ def start_session(label: str = '') -> Path:
     _events_writer = csv.writer(_events_fp)
     _events_writer.writerow(['timestamp_sec', 'event'])
 
+    # Per-frame watch-audio index, for post-session recalibration
+    _watch_audio_frames_fp     = open(_session_dir / 'watch_audio_frames.csv', 'w', newline='')
+    _watch_audio_frames_writer = csv.writer(_watch_audio_frames_fp)
+    _watch_audio_frames_writer.writerow(['sample_offset', 'num_samples', 'watch_ts_ms'])
+    _watch_audio_session_samples = 0
+
     _sync = {
         'session_start_epoch':    time.time(),
         'label':                  label,
@@ -279,7 +311,7 @@ def start_session(label: str = '') -> Path:
 
 
 def close_session():
-    global _watch_wf, _mic_wf, _imu_fp, _cam_fp, _events_fp
+    global _watch_wf, _mic_wf, _imu_fp, _cam_fp, _events_fp, _watch_audio_frames_fp
 
     for wf in [_watch_wf, _mic_wf]:
         if wf:
@@ -298,6 +330,10 @@ def close_session():
         _events_fp.close()
         _events_fp = None
 
+    if _watch_audio_frames_fp:
+        _watch_audio_frames_fp.close()
+        _watch_audio_frames_fp = None
+
     if _session_dir:
         with open(_session_dir / 'sync.json', 'w') as f:
             json.dump(_sync, f, indent=2)
@@ -307,6 +343,7 @@ def close_session():
                   'rtbgn_watch_ms', 'rtbgn_pc_sec', 'rtend_watch_ms', 'rtend_pc_sec'):
             print(f'  {k} = {_sync.get(k)}')
         _check_watch_connection_quality()
+        _recalibrate_session_trials(_session_dir, _trial_dataset_root)
 
 
 def _check_watch_connection_quality():
@@ -335,6 +372,134 @@ def _check_watch_connection_quality():
         print(f'[QUALITY] WARNING: watch connection may have stalled during this session '
               f'(only {ratio:.1%} of real time accounted for on the watch clock). '
               f'Consider re-collecting this session.')
+    elif ratio > 1.05:
+        print(f'[QUALITY] NOTE: watch clock ran {ratio:.1%} of PC-clock speed this session — '
+              f'this is normal clock-rate drift and has already been corrected for by '
+              f'the post-session recalibration below.')
+
+
+def _read_wav_samples(path: Path):
+    """Reads a mono 16-bit PCM wav file, returning (sample_rate, int16 ndarray)."""
+    with wave.open(str(path), 'rb') as wf:
+        sr = wf.getframerate()
+        n  = wf.getnframes()
+        data = np.frombuffer(wf.readframes(n), dtype='<i2')
+    return sr, data
+
+
+def _recalibrate_session_trials(session_dir: Path, dataset_root: Path):
+    """Live trial cropping can only use RTBGN (known at session start) to map
+    watch_ts_ms → PC time, which corrects the starting offset but not the
+    watch-vs-PC clock RATE (drift accumulates the longer the session runs).
+    RTEND is only known once the session ends — so this runs at that point,
+    building a corrected two-point linear mapping from RTBGN *and* RTEND, and
+    re-crops every trial recorded in this session directly from the
+    untouched session-level raw files (watch_audio.wav + its per-frame index,
+    and imu.csv), overwriting each trial's watch_audio.wav/imu.csv with the
+    corrected version. Surface mic and fingertip IMU aren't affected by watch
+    clock drift, so their trial crops are left as-is.
+    """
+    sync_path = session_dir / 'sync.json'
+    if not sync_path.exists():
+        return
+    with open(sync_path) as f:
+        sync = json.load(f)
+
+    rtbgn_watch_ms = sync.get('rtbgn_watch_ms')
+    rtbgn_pc_sec   = sync.get('rtbgn_pc_sec')
+    rtend_watch_ms = sync.get('rtend_watch_ms')
+    rtend_pc_sec   = sync.get('rtend_pc_sec')
+    if not (rtbgn_watch_ms and rtbgn_pc_sec and rtend_watch_ms and rtend_pc_sec):
+        _log('RECAL', 'RTBGN/RTEND incomplete — skipping post-session recalibration')
+        return
+
+    watch_span_sec = (rtend_watch_ms - rtbgn_watch_ms) / 1000.0
+    pc_span_sec    = rtend_pc_sec - rtbgn_pc_sec
+    if watch_span_sec <= 0 or pc_span_sec <= 0:
+        _log('RECAL', 'invalid RTBGN/RTEND span — skipping recalibration')
+        return
+    rate = pc_span_sec / watch_span_sec   # PC seconds per watch second
+
+    def aligned_pc(watch_ts_ms: float) -> float:
+        return rtbgn_pc_sec + (watch_ts_ms - rtbgn_watch_ms) / 1000.0 * rate
+
+    metadata_path = dataset_root / 'metadata.csv'
+    if not metadata_path.exists():
+        return
+    session_name = session_dir.name
+    with open(metadata_path) as f:
+        trials = [row for row in csv.DictReader(f) if row['session'] == session_name]
+    if not trials:
+        _log('RECAL', 'no trials from this session found in metadata.csv — nothing to recalibrate')
+        return
+
+    frames_path = session_dir / 'watch_audio_frames.csv'
+    wav_path    = session_dir / 'watch_audio.wav'
+    imu_path    = session_dir / 'imu.csv'
+
+    frame_rows = []
+    wav_samples = None
+    if frames_path.exists() and wav_path.exists():
+        with open(frames_path) as f:
+            frame_rows = list(csv.DictReader(f))
+        _, wav_samples = _read_wav_samples(wav_path)
+    else:
+        _log('RECAL', 'missing watch_audio_frames.csv/watch_audio.wav — skipping audio recalibration')
+
+    imu_rows = []
+    if imu_path.exists():
+        with open(imu_path) as f:
+            imu_rows = list(csv.DictReader(f))
+    else:
+        _log('RECAL', 'missing imu.csv — skipping IMU recalibration')
+
+    n_done = 0
+    for trial in trials:
+        label       = trial['label']
+        trial_idx   = int(trial['trial_idx'])
+        trial_start = float(trial['start_sec'])
+        trial_end   = float(trial['end_sec'])
+        trial_dir   = dataset_root / label / f'trial_{trial_idx:03d}'
+        if not trial_dir.exists():
+            continue
+
+        if frame_rows and wav_samples is not None:
+            selected = []
+            for fr in frame_rows:
+                wts_str = fr.get('watch_ts_ms', '')
+                if not wts_str:
+                    continue
+                apc = aligned_pc(float(wts_str)) - WATCH_AUDIO_LATENCY_SEC
+                if trial_start <= apc <= trial_end:
+                    start_i = int(fr['sample_offset'])
+                    n       = int(fr['num_samples'])
+                    selected.append((apc, wav_samples[start_i:start_i + n]))
+            if selected:
+                selected.sort(key=lambda item: item[0])
+                corrected = np.concatenate([chunk for _, chunk in selected])
+                wavfile.write(trial_dir / 'watch_audio.wav', WATCH_AUDIO_SR, corrected)
+
+        if imu_rows:
+            corrected_rows = []
+            for row in imu_rows:
+                wts_str = row.get('watch_ts_ms', '')
+                if not wts_str or wts_str == '0':
+                    continue
+                apc = aligned_pc(float(wts_str))
+                if trial_start <= apc <= trial_end:
+                    corrected_rows.append((apc - trial_start, row['sensor'], row['v1'], row['v2'], row['v3']))
+            if corrected_rows:
+                corrected_rows.sort(key=lambda r: r[0])
+                with open(trial_dir / 'imu.csv', 'w', newline='') as f:
+                    w = csv.writer(f)
+                    w.writerow(['time_aligned', 'sensor', 'v1', 'v2', 'v3'])
+                    for ta, sensor, v1, v2, v3 in corrected_rows:
+                        w.writerow([f'{ta:.6f}', sensor, v1, v2, v3])
+
+        n_done += 1
+
+    _log('RECAL', f'recalibrated {n_done}/{len(trials)} trial(s) using two-point RTBGN/RTEND mapping '
+                  f'(rate={rate:.6f} PC-sec per watch-sec, i.e. {(rate-1)*100:+.2f}% drift)')
 
 
 # ─── Watch audio writer ─────────────────────────────────────────────────────────
@@ -346,7 +511,7 @@ def _write_watch_audio(raw_bytes: bytes, watch_ts_ms: float | None = None):
     to have been received. If watch_ts_ms is unavailable (e.g. a legacy
     packet without the timestamp prefix), it's left as None and trial
     cropping falls back to this frame's PC arrival time."""
-    global _watch_audio_offset, _watch_rms
+    global _watch_audio_offset, _watch_rms, _watch_audio_session_samples
     ts = _offset()   # PC arrival time — used only for the session-level offset display and as a fallback
     samples    = np.frombuffer(raw_bytes, dtype='<i2').astype(np.float32)
     _watch_rms = float(np.sqrt(np.mean(samples ** 2)))
@@ -357,6 +522,14 @@ def _write_watch_audio(raw_bytes: bytes, watch_ts_ms: float | None = None):
             _log('WATCH', f'first packet  offset={_watch_audio_offset:.4f}s')
     if _watch_wf:
         _watch_wf.writeframes(raw_bytes)
+
+    n_samples = len(raw_bytes) // 2
+    if _watch_audio_frames_writer:
+        _watch_audio_frames_writer.writerow([
+            _watch_audio_session_samples, n_samples,
+            f'{watch_ts_ms:.0f}' if watch_ts_ms else '',
+        ])
+    _watch_audio_session_samples += n_samples
 
     with _rolling_lock:   # rolling buffer is filled regardless of touch state
         _watch_audio_rolling.append((ts, raw_bytes, watch_ts_ms))
@@ -565,9 +738,9 @@ def process_trial(start: float, end: float, snapshot: dict):
     wa_frames = []
     for (ts, chunk, watch_ts_ms) in snapshot['watch_audio']:
         if use_rtbgn and watch_ts_ms:
-            aligned_pc = (watch_ts_ms - rtbgn_watch_ms) / 1000.0 + rtbgn_pc_sec
+            aligned_pc = (watch_ts_ms - rtbgn_watch_ms) / 1000.0 + rtbgn_pc_sec - WATCH_AUDIO_LATENCY_SEC
         else:
-            aligned_pc = ts   # fall back to PC-arrival time if RTBGN/watch_ts_ms is unavailable
+            aligned_pc = ts - WATCH_AUDIO_LATENCY_SEC   # fall back to PC-arrival time if RTBGN/watch_ts_ms is unavailable
         if trial_start <= aligned_pc <= trial_end:
             wa_frames.append((aligned_pc, chunk))
     wa_frames.sort(key=lambda item: item[0])
@@ -700,59 +873,91 @@ def _mic_callback(indata, frames, time_info, status):
             _trial_buffers['mic'].append((_offset(), amplified.copy()))
 
 
-# ─── Camera (fingertip IMU) thread ───────────────────────────────────────────────
-def _camera_thread_fn(camera_index: int, show_window: bool,
-                       camera_pitch_deg, camera_roll_deg: float):
-    global _cam_cap, _cam_tracker
+# ─── Camera (fingertip IMU) worker process ───────────────────────────────────────
+#
+# MediaPipe inference is CPU-heavy and, running as an in-process thread,
+# competed for the GIL with the audio callback and network thread — under
+# load this showed up as the surface mic's captured duration falling short
+# of the real trial window. Running the camera + MediaPipe tracker in a
+# genuinely separate OS process removes that GIL contention entirely: this
+# process's only job is capturing frames and running inference, and it talks
+# back to the main process solely through the queues below. It does NOT call
+# any of the shared writer functions (_write_fingertip_imu, etc.) directly —
+# with multiprocessing's default 'spawn' start method, this process gets its
+# own fresh copy of all module-level state, so those shared file handles/
+# locks wouldn't actually be shared anyway.
+def _camera_process_fn(camera_index: int, show_window: bool,
+                        camera_pitch_deg, camera_roll_deg: float,
+                        session_start: float,
+                        record_queue: "mp.Queue", frame_queue,
+                        stop_flag: "mp.Event"):
+    import cv2 as _cv2
+    from fingertip_imu_multi import MultiFingertipIMUTracker, gravity_vector_from_camera_tilt
 
     gravity_mm_s2 = None
     if camera_pitch_deg is not None:
         gravity_mm_s2 = gravity_vector_from_camera_tilt(camera_pitch_deg, camera_roll_deg)
-        _log('CAM', f'applying gravity compensation pitch={camera_pitch_deg} roll={camera_roll_deg}')
-    else:
-        _log('CAM', 'no gravity compensation (pure kinematic acceleration)')
 
-    _cam_tracker = MultiFingertipIMUTracker(
+    tracker = MultiFingertipIMUTracker(
         max_num_hands=1,
         smoothing_window=CAM_SMOOTHING_WINDOW,
         gravity_mm_s2=gravity_mm_s2,
         ema_alpha=CAM_EMA_ALPHA,
     )
-    _cam_cap = cv2.VideoCapture(camera_index)
-    if not _cam_cap.isOpened():
-        _log('CAM', f'could not open camera (index={camera_index}). Proceeding without fingertip IMU.')
+    cap = _cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        record_queue.put(None)   # tells the main process the camera failed to open
         return
 
-    _log('CAM', f'started (index={camera_index})')
-
-    while not stop_event.is_set():
-        success, frame = _cam_cap.read()
+    while not stop_flag.is_set():
+        success, frame = cap.read()
         if not success:
             continue
-        frame = cv2.flip(frame, 1)
-        ts = _offset()   # use the same session-relative clock as the other streams
-        records = _cam_tracker.update(frame, timestamp=ts)
-        _write_fingertip_imu(records)
+        frame = _cv2.flip(frame, 1)
+        # time.perf_counter() is backed by a machine-wide monotonic clock (on
+        # POSIX, CLOCK_MONOTONIC; on Windows, QueryPerformanceCounter — both
+        # shared across processes, not per-process), so subtracting the same
+        # session_start value captured in the main process keeps this
+        # timestamp on the same timeline as _offset() there.
+        ts = time.perf_counter() - session_start
+        records = tracker.update(frame, timestamp=ts)
+        try:
+            record_queue.put_nowait(records)
+        except Exception:
+            pass   # main process fell behind — drop this frame's records rather than block capture
 
-        if show_window:
-            _cam_tracker.draw(frame)
-            _cam_tracker.draw_axes(frame)
-            # On macOS, imshow/waitKey must be called from the main thread.
-            # Keep only the latest frame in the queue (drop the previous one
-            # if full) so the main thread can pick it up for display.
-            if _display_queue.full():
+        if show_window and frame_queue is not None:
+            tracker.draw(frame)
+            tracker.draw_axes(frame)
+            if frame_queue.full():
                 try:
-                    _display_queue.get_nowait()
-                except queue.Empty:
+                    frame_queue.get_nowait()
+                except Exception:
                     pass
             try:
-                _display_queue.put_nowait(frame)
-            except queue.Full:
+                frame_queue.put_nowait(frame)
+            except Exception:
                 pass
 
-    _cam_cap.release()
-    _cam_tracker.close()
-    _log('CAM', 'stopped')
+    cap.release()
+    tracker.close()
+
+
+def _camera_bridge_thread_fn(record_queue: "mp.Queue"):
+    """Pulls fingertip IMU records off the queue fed by the camera process and
+    writes them exactly as _camera_thread_fn used to. This thread does no
+    CPU-heavy work of its own — the MediaPipe inference already happened in
+    the child process — so it doesn't meaningfully compete for the GIL with
+    the audio/network threads the way the old in-process camera thread did."""
+    while not stop_event.is_set():
+        try:
+            records = record_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if records is None:
+            _log('CAM', 'camera process reported it could not open the camera')
+            continue
+        _write_fingertip_imu(records)
 
 
 # ─── TCP net thread ───────────────────────────────────────────────────────────────
@@ -1006,15 +1211,28 @@ def main():
     net_t = threading.Thread(target=_net_thread_fn, daemon=True)
     net_t.start()
 
-    # Fingertip virtual IMU (camera) thread
-    cam_t = None
+    # Fingertip virtual IMU: camera capture + MediaPipe inference run in a
+    # separate OS process (see _camera_process_fn); a lightweight bridge
+    # thread here just relays the results into the normal write path.
+    cam_proc = None
+    cam_bridge_t = None
+    record_queue = None
+    frame_queue = None
+    cam_stop_flag = None
     if not args.no_camera:
-        cam_t = threading.Thread(
-            target=_camera_thread_fn,
-            args=(args.camera_index, args.show_camera, args.camera_pitch_deg, args.camera_roll_deg),
+        record_queue  = mp.Queue(maxsize=8)
+        frame_queue   = mp.Queue(maxsize=1) if args.show_camera else None
+        cam_stop_flag = mp.Event()
+        cam_proc = mp.Process(
+            target=_camera_process_fn,
+            args=(args.camera_index, args.show_camera, args.camera_pitch_deg, args.camera_roll_deg,
+                  _session_start, record_queue, frame_queue, cam_stop_flag),
             daemon=True,
         )
-        cam_t.start()
+        cam_proc.start()
+        cam_bridge_t = threading.Thread(target=_camera_bridge_thread_fn, args=(record_queue,), daemon=True)
+        cam_bridge_t.start()
+        _log('CAM', f'started in a separate process (index={args.camera_index}, pid={cam_proc.pid})')
     else:
         print('[CAM] --no-camera specified → fingertip IMU not collected')
 
@@ -1032,10 +1250,16 @@ def main():
     def _shutdown(sig=None, frame=None):
         print('\n[RUN] Stopping...')
         stop_event.set()
+        if cam_stop_flag:
+            cam_stop_flag.set()
         mic_stream.stop();  mic_stream.close()
         net_t.join(timeout=2.0)
-        if cam_t:
-            cam_t.join(timeout=2.0)
+        if cam_proc:
+            cam_proc.join(timeout=2.0)
+            if cam_proc.is_alive():
+                cam_proc.terminate()
+        if cam_bridge_t:
+            cam_bridge_t.join(timeout=2.0)
         key_listener.stop()
         trial_worker_t.join(timeout=2.0)
         if args.show_camera:
@@ -1062,14 +1286,14 @@ def main():
             end='', flush=True,
         )
 
-    if args.show_camera:
+    if args.show_camera and frame_queue is not None:
         # On macOS and similar platforms, imshow/waitKey must be called from
-        # the main thread, so the main thread pulls frames the camera thread
-        # placed in the queue for display.
+        # the main thread, so the main thread pulls frames the camera
+        # process placed in frame_queue for display.
         last_status_t = 0.0
         while not stop_event.is_set():
             try:
-                frame = _display_queue.get(timeout=0.05)
+                frame = frame_queue.get(timeout=0.05)
                 cv2.imshow('Fingertip IMU (WristPad)', frame)
             except queue.Empty:
                 pass
