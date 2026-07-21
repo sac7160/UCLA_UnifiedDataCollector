@@ -121,6 +121,10 @@ CAM_SMOOTHING_WINDOW = 3
 CAM_EMA_ALPHA        = 0.2
 CAM_FLUSH_EVERY_N    = 10   # flush every N frames (records for 5 fingers)
 
+# Index-finger trajectory trail overlay (--show-camera preview only)
+TRAJ_TRAIL_MAXLEN = 60
+TRAJ_TRAIL_COLOR   = (60, 220, 255)   # BGR
+
 DATA_ROOT        = Path('data')
 SESSION_PREFIX   = 'session'
 
@@ -987,6 +991,8 @@ def _camera_process_fn(camera_index: int, show_window: bool,
         record_queue.put(None)   # tells the main process the camera failed to open
         return
 
+    trail = deque(maxlen=TRAJ_TRAIL_MAXLEN)   # index-finger 2D trail, preview only
+
     while not stop_flag.is_set():
         success, frame = cap.read()
         if not success:
@@ -1009,6 +1015,20 @@ def _camera_process_fn(camera_index: int, show_window: bool,
         if show_window and frame_queue is not None:
             tracker.draw(frame)
             tracker.draw_axes(frame)
+
+            if traj['x_px'] is not None:
+                trail.append((traj['x_px'], traj['y_px']))
+            # Fading trail: older points drawn thinner and dimmer (same style
+            # as index_trajectory_viewer.py's standalone preview).
+            n = len(trail)
+            for i in range(1, n):
+                alpha = i / n
+                thickness = max(1, int(alpha * 4))
+                color = tuple(int(c * alpha) for c in TRAJ_TRAIL_COLOR)
+                _cv2.line(frame, trail[i - 1], trail[i], color, thickness)
+            if trail:
+                _cv2.circle(frame, trail[-1], 6, TRAJ_TRAIL_COLOR, -1)
+
             if frame_queue.full():
                 try:
                     frame_queue.get_nowait()
@@ -1250,11 +1270,16 @@ def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue"):
                 continue
             frame = _cv2.flip(frame, 1)
             tracker.update(frame, timestamp=time.perf_counter())
-            tracker.draw(frame)
-            _cv2.putText(frame, "press 'c' to calibrate, any other key to start recording",
-                         (10, frame.shape[0] - 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            # Draw the live-preview overlay on a copy, not `frame` itself —
+            # `frame` (unannotated) is what gets passed into calibration
+            # below, so its own on-screen prompts don't end up overlapping
+            # this loop's "press c to calibrate" reminder text.
+            display = frame.copy()
+            tracker.draw(display)
+            _cv2.putText(display, "press 'c' to calibrate, any other key to start recording",
+                         (10, display.shape[0] - 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                          (0, 255, 255), 1, _cv2.LINE_AA)
-            _cv2.imshow(window_name, frame)
+            _cv2.imshow(window_name, display)
             key = _cv2.waitKey(20) & 0xFF
             if key == ord('c'):
                 new_calibration = _run_calibration(tracker, frame, window_name)

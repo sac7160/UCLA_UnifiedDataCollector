@@ -164,8 +164,13 @@ def main():
             if frame_count % FLUSH_EVERY_N_FRAMES == 0:
                 csv_file.flush()
 
+            # All live-preview overlays draw onto a copy, not `frame` itself —
+            # `frame` (unannotated) is what gets passed into calibration
+            # below, so its own on-screen prompts don't overlap this loop's
+            # skeleton/trail/readout drawing.
+            display = frame.copy()
             if not args.no_skeleton:
-                tracker.draw(frame)
+                tracker.draw(display)
 
             # Fading trail: older points drawn thinner and dimmer.
             n = len(trail)
@@ -173,16 +178,16 @@ def main():
                 alpha = i / n
                 thickness = max(1, int(alpha * 4))
                 color = tuple(int(c * alpha) for c in TRAIL_COLOR)
-                cv2.line(frame, trail[i - 1], trail[i], color, thickness)
+                cv2.line(display, trail[i - 1], trail[i], color, thickness)
             if trail:
-                cv2.circle(frame, trail[-1], 6, TRAIL_COLOR, -1)
+                cv2.circle(display, trail[-1], 6, TRAIL_COLOR, -1)
 
-            _draw_readout(frame, index_record.detected, traj['x_px'], traj['y_px'],
+            _draw_readout(display, index_record.detected, traj['x_px'], traj['y_px'],
                           index_record.pos_x, index_record.pos_y, index_record.pos_z,
                           traj['local_vec'], traj['global_xy'], traj['frame_xy'],
                           traj['height_mm'], calibration)
 
-            cv2.imshow(WINDOW_NAME, frame)
+            cv2.imshow(WINDOW_NAME, display)
             key = cv2.waitKey(1) & 0xFF
             if key in (ord('q'), 27):
                 break

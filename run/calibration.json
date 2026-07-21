@@ -1,0 +1,18 @@
+{
+  "scale_factor": 0.9356364424636275,
+  "mediapipe_reported_mm": 80.15934031226621,
+  "measured_mm": 75.0,
+  "wrist_landmark": 0,
+  "middle_mcp_landmark": 9,
+  "timestamp": "2026-07-21T13:04:19.901036",
+  "mic_center_px": [
+    1172.0,
+    707.0
+  ],
+  "mic_diameter_px": 98.0,
+  "mic_diameter_mm": 30.0,
+  "mm_per_pixel": 0.30612244897959184,
+  "camera_to_surface_mm": 521.0,
+  "focal_length_px": 1834.1065235066135,
+  "wrist_mcp_apparent_px_at_calibration": 264.02685079269867
+}
