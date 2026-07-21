@@ -21,7 +21,7 @@ trajectory_sessions/calibration.json:
       wrist-relative local position for the index fingertip (rather than
       trusting MediaPipe's own internal, undocumented world-landmark origin).
   (B) Global mic-anchored origin: click the two opposite edges of the contact
-      mic's visible diameter (a known 27mm reference) to set it as the fixed
+      mic's visible diameter (a known 30mm reference) to set it as the fixed
       global origin and derive a pixels-to-mm scale for the writing surface —
       unlike (A), this doesn't reset every frame, so it can actually capture
       whole-hand translation. Optionally also measure the camera-to-surface
@@ -126,29 +126,51 @@ def _click_two_points(frame, instructions: str):
 
 
 def _run_calibration(tracker, frame) -> dict | None:
-    """(A) Freezes the current frame's wrist and middle-knuckle positions, asks
-    for the real physically-measured distance between those two points, and
-    derives a scale-correction factor (real_mm / mediapipe_reported_mm) for
-    wrist-relative local positions.
+    """Does the one on-screen click step first (mic diameter), then groups
+    both physical-measurement terminal prompts together afterward, so you're
+    not alternating between the video window and the terminal.
 
-    (B) Then asks you to click the two opposite edges of the contact mic's
-    visible diameter, to set it as a fixed global origin + pixels-to-mm scale
-    for the writing surface. Optionally also asks for the camera-to-surface
-    distance, which — combined with (A)'s known real wrist-to-knuckle distance
-    and its apparent pixel size right now — derives an approximate focal
-    length (depth-from-known-size), enabling a rough height/Z estimate above
-    the surface for later frames.
+    (A) Local wrist-relative scale: the real physically-measured wrist-to-
+    middle-knuckle distance vs. what MediaPipe reports gives a
+    scale-correction factor for wrist-relative local positions.
+
+    (B) Global mic-anchored origin: the two mic-diameter clicks set a fixed
+    global origin + pixels-to-mm scale for the writing surface. Optionally
+    also asks for the camera-to-surface distance, which — combined with (A)'s
+    known real wrist-to-knuckle distance and its apparent pixel size right
+    now — derives an approximate focal length (depth-from-known-size),
+    enabling a rough height/Z estimate above the surface for later frames.
     """
     h, w = frame.shape[:2]
 
-    # ---- (A) local wrist-relative scale ----
+    # ---- gather everything from the current frame first, no prompts yet ----
     wrist_mm = _world_landmark_mm(tracker, WRIST_LANDMARK)
     mcp_mm = _world_landmark_mm(tracker, MIDDLE_MCP_LANDMARK)
     if wrist_mm is None or mcp_mm is None:
         print('[CALIBRATE] no hand detected right now — hold your hand steady in frame and try again')
         return None
-
     reported_mm = float(np.linalg.norm(mcp_mm - wrist_mm))
+
+    wrist_px = _landmark_px(tracker, WRIST_LANDMARK, w, h)
+    mcp_px = _landmark_px(tracker, MIDDLE_MCP_LANDMARK, w, h)
+    apparent_px_at_calibration = (float(np.linalg.norm(mcp_px - wrist_px))
+                                  if wrist_px is not None and mcp_px is not None else None)
+
+    # ---- the one on-screen step: click the mic's diameter ----
+    mic_points = _click_two_points(frame, 'click 2 opposite edges of the mic diameter, Esc to skip')
+    mic_center_px = mic_diameter_px = mm_per_pixel = None
+    if mic_points is not None:
+        p0 = np.array(mic_points[0], dtype=np.float64)
+        p1 = np.array(mic_points[1], dtype=np.float64)
+        mic_diameter_px = float(np.linalg.norm(p1 - p0))
+        if mic_diameter_px <= 0:
+            print('[CALIBRATE] invalid click distance — skipping global-origin calibration')
+            mic_diameter_px = None
+        else:
+            mic_center_px = ((p0 + p1) / 2).tolist()
+            mm_per_pixel = MIC_DIAMETER_MM / mic_diameter_px
+
+    # ---- now both physical-measurement prompts, back to back in the terminal ----
     print(f'[CALIBRATE] MediaPipe reports wrist-to-middle-knuckle distance = {reported_mm:.2f}mm')
     try:
         measured_mm = float(input('[CALIBRATE] enter the same distance as physically measured (mm): '))
@@ -158,8 +180,8 @@ def _run_calibration(tracker, frame) -> dict | None:
     if measured_mm <= 0 or reported_mm <= 0:
         print('[CALIBRATE] distance must be positive — calibration cancelled')
         return None
-
     scale_factor = measured_mm / reported_mm
+
     calibration = {
         'scale_factor': scale_factor,
         'mediapipe_reported_mm': reported_mm,
@@ -169,51 +191,33 @@ def _run_calibration(tracker, frame) -> dict | None:
         'timestamp': datetime.now().isoformat(),
     }
 
-    # ---- (B) mic-anchored global origin + XY scale ----
-    print("[CALIBRATE] now click the two opposite edges of the contact mic's "
-          "visible diameter (Esc to skip global-origin calibration)")
-    mic_points = _click_two_points(frame, 'click 2 opposite edges of the mic diameter, Esc to skip')
-    if mic_points is not None:
-        p0 = np.array(mic_points[0], dtype=np.float64)
-        p1 = np.array(mic_points[1], dtype=np.float64)
-        diameter_px = float(np.linalg.norm(p1 - p0))
-        if diameter_px <= 0:
-            print('[CALIBRATE] invalid click distance — skipping global-origin calibration')
-        else:
-            mm_per_pixel = MIC_DIAMETER_MM / diameter_px
-            calibration.update({
-                'mic_center_px': ((p0 + p1) / 2).tolist(),
-                'mic_diameter_px': diameter_px,
-                'mic_diameter_mm': MIC_DIAMETER_MM,
-                'mm_per_pixel': mm_per_pixel,
-            })
-
-            # depth-from-known-size focal length, reusing (A)'s wrist-to-knuckle
-            # real distance as the size reference
-            wrist_px = _landmark_px(tracker, WRIST_LANDMARK, w, h)
-            mcp_px = _landmark_px(tracker, MIDDLE_MCP_LANDMARK, w, h)
-            focal_length_px = None
-            camera_to_surface_mm = None
-            if wrist_px is not None and mcp_px is not None:
-                apparent_px_at_calibration = float(np.linalg.norm(mcp_px - wrist_px))
-                try:
-                    raw = input('[CALIBRATE] measure camera-to-surface distance right now (mm), '
-                                'or leave blank to skip height/Z tracking: ').strip()
-                    camera_to_surface_mm = float(raw) if raw else None
-                except ValueError:
-                    camera_to_surface_mm = None
-                if camera_to_surface_mm and camera_to_surface_mm > 0 and apparent_px_at_calibration > 0:
-                    focal_length_px = apparent_px_at_calibration * camera_to_surface_mm / measured_mm
-                    calibration.update({
-                        'camera_to_surface_mm': camera_to_surface_mm,
-                        'focal_length_px': focal_length_px,
-                        'wrist_mcp_apparent_px_at_calibration': apparent_px_at_calibration,
-                    })
-
-            print(f'[CALIBRATE] mic origin set at {calibration["mic_center_px"]} px, '
-                  f'mm_per_pixel={mm_per_pixel:.4f}'
-                  + (f', focal_length_px={focal_length_px:.1f} (height/Z tracking enabled)'
-                     if focal_length_px else ' (height/Z tracking skipped)'))
+    focal_length_px = None
+    if mm_per_pixel is not None:
+        calibration.update({
+            'mic_center_px': mic_center_px,
+            'mic_diameter_px': mic_diameter_px,
+            'mic_diameter_mm': MIC_DIAMETER_MM,
+            'mm_per_pixel': mm_per_pixel,
+        })
+        if apparent_px_at_calibration and apparent_px_at_calibration > 0:
+            try:
+                raw = input('[CALIBRATE] measure camera-to-surface distance right now (mm) — '
+                            'hand should be resting on the surface, '
+                            'or leave blank to skip height/Z tracking: ').strip()
+                camera_to_surface_mm = float(raw) if raw else None
+            except ValueError:
+                camera_to_surface_mm = None
+            if camera_to_surface_mm and camera_to_surface_mm > 0:
+                focal_length_px = apparent_px_at_calibration * camera_to_surface_mm / measured_mm
+                calibration.update({
+                    'camera_to_surface_mm': camera_to_surface_mm,
+                    'focal_length_px': focal_length_px,
+                    'wrist_mcp_apparent_px_at_calibration': apparent_px_at_calibration,
+                })
+        print(f'[CALIBRATE] mic origin set at {mic_center_px} px, '
+              f'mm_per_pixel={mm_per_pixel:.4f}'
+              + (f', focal_length_px={focal_length_px:.1f} (height/Z tracking enabled)'
+                 if focal_length_px else ' (height/Z tracking skipped)'))
     else:
         print('[CALIBRATE] global-origin calibration skipped — only local (wrist-relative) values available')
 
@@ -225,7 +229,7 @@ def _run_calibration(tracker, frame) -> dict | None:
 
 
 def _draw_readout(frame, detected: bool, x_px, y_px, pos_x, pos_y, pos_z,
-                   local_vec, global_xy, height_mm, calibration: dict | None):
+                   local_vec, global_xy, frame_xy, height_mm, calibration: dict | None):
     """Live numeric overlay so the 2D/3D/global coordinates can be
     sanity-checked by eye in real time instead of only reading them back from
     the CSV afterward."""
@@ -250,12 +254,18 @@ def _draw_readout(frame, detected: bool, x_px, y_px, pos_x, pos_y, pos_z,
     else:
         global_line = 'global mm (mic origin): --'
 
+    if frame_xy is not None:
+        frame_line = f'frame mm (corner origin): x={frame_xy[0]:7.1f}  y={frame_xy[1]:7.1f}'
+    else:
+        frame_line = 'frame mm (corner origin): --'
+
     lines = [
         f'detected: {"yes" if detected else "no"}',
         f'2D px : x={x_px:5d}  y={y_px:5d}' if detected else '2D px : --',
         f'3D mm : x={pos_x:7.1f}  y={pos_y:7.1f}  z={pos_z:7.1f}' if detected else '3D mm : --',
         local_line,
         global_line,
+        frame_line,
         calib_line,
     ]
     box_h = 22 * len(lines) + 16
@@ -296,7 +306,22 @@ def main():
 
     tracker = MultiFingertipIMUTracker(max_num_hands=1)
     trail = deque(maxlen=max(2, args.trail_length))
+
+    # Reuse a previous calibration if one exists — scale_factor is a personal
+    # constant (how far off MediaPipe's generic hand-size assumption is from
+    # your actual hand), not something that needs re-measuring every run.
+    # Press 'c' any time to recalibrate anyway (e.g. different person, mic
+    # moved, camera repositioned).
     calibration: dict | None = None
+    if CALIBRATION_FILE.exists():
+        try:
+            with open(CALIBRATION_FILE) as f:
+                calibration = json.load(f)
+            print(f'[CALIBRATE] loaded existing calibration from {calibration.get("timestamp", "?")} '
+                  f'(scale_factor={calibration.get("scale_factor"):.4f}) — press c to redo')
+        except (json.JSONDecodeError, OSError, TypeError) as e:
+            print(f'[CALIBRATE] could not load {CALIBRATION_FILE} ({e}) — starting uncalibrated')
+            calibration = None
 
     csv_file = open(out_path, 'w', newline='')
     writer = csv.writer(csv_file)
@@ -304,7 +329,8 @@ def main():
                       'x_px', 'y_px', 'x_norm', 'y_norm',
                       'pos_x_mm', 'pos_y_mm', 'pos_z_mm',
                       'local_x_mm', 'local_y_mm', 'local_z_mm', 'calibrated',
-                      'global_x_mm', 'global_y_mm', 'height_mm'])
+                      'global_x_mm', 'global_y_mm', 'height_mm',
+                      'frame_x_mm', 'frame_y_mm'])
 
     cv2.namedWindow(WINDOW_NAME)
     print(f'[RUN] logging index-finger trajectory to {out_path} — press q or ESC to stop, '
@@ -346,12 +372,18 @@ def main():
             # (Part B) — fixed for the whole session, unlike local_vec above,
             # so this one can actually reflect whole-hand translation.
             global_xy = None
+            frame_xy = None
             height_mm = None
             if calibration is not None and calibration.get('mm_per_pixel') is not None and x_px is not None:
-                origin_x_px, origin_y_px = calibration['mic_center_px']
                 mm_per_pixel = calibration['mm_per_pixel']
+                origin_x_px, origin_y_px = calibration['mic_center_px']
                 global_xy = ((x_px - origin_x_px) * mm_per_pixel,
                              (y_px - origin_y_px) * mm_per_pixel)
+
+                # Same scale, but referenced to the frame's top-left corner
+                # (pixel 0,0) instead of the mic — a camera-referenced
+                # translation rather than a physical-object-referenced one.
+                frame_xy = (x_px * mm_per_pixel, y_px * mm_per_pixel)
 
                 # Height above the calibration surface, via depth-from-known-size:
                 # compare the wrist-to-knuckle apparent pixel size now against its
@@ -382,6 +414,8 @@ def main():
                 f'{global_xy[0]:.3f}' if global_xy is not None else '',
                 f'{global_xy[1]:.3f}' if global_xy is not None else '',
                 f'{height_mm:.3f}' if height_mm is not None else '',
+                f'{frame_xy[0]:.3f}' if frame_xy is not None else '',
+                f'{frame_xy[1]:.3f}' if frame_xy is not None else '',
             ])
             frame_count += 1
             if frame_count % FLUSH_EVERY_N_FRAMES == 0:
@@ -402,7 +436,7 @@ def main():
 
             _draw_readout(frame, index_record.detected, x_px, y_px,
                           index_record.pos_x, index_record.pos_y, index_record.pos_z,
-                          local_vec, global_xy, height_mm, calibration)
+                          local_vec, global_xy, frame_xy, height_mm, calibration)
 
             cv2.imshow(WINDOW_NAME, frame)
             key = cv2.waitKey(1) & 0xFF
@@ -412,6 +446,8 @@ def main():
                 new_calibration = _run_calibration(tracker, frame)
                 if new_calibration is not None:
                     calibration = new_calibration
+    except KeyboardInterrupt:
+        print('\n[RUN] interrupted by Ctrl+C')
     finally:
         cap.release()
         cv2.destroyAllWindows()
