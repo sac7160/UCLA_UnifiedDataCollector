@@ -121,6 +121,10 @@ CAM_SMOOTHING_WINDOW = 3
 CAM_EMA_ALPHA        = 0.2
 CAM_FLUSH_EVERY_N    = 10   # flush every N frames (records for 5 fingers)
 
+# Index-finger trajectory trail overlay (--show-camera preview only)
+TRAJ_TRAIL_MAXLEN = 60
+TRAJ_TRAIL_COLOR   = (60, 220, 255)   # BGR
+
 DATA_ROOT        = Path('data')
 SESSION_PREFIX   = 'session'
 
@@ -129,6 +133,12 @@ _lock = threading.Lock()
 
 _session_dir:   Path | None = None
 _session_start: float | None = None
+# time.time() reference for the same instant as _session_start. perf_counter()
+# is only guaranteed monotonic *within* a process — Python's docs don't promise
+# a shared epoch across processes, and empirically it isn't shared here. The
+# camera subprocess timestamps its frames off this wall-clock reference instead
+# so its timestamps land on the same timeline as _offset() in this process.
+_session_start_wall: float | None = None
 
 _watch_wf:   wave.Wave_write | None = None
 _mic_wf:     wave.Wave_write | None = None
@@ -175,13 +185,16 @@ _trial_lock       = threading.Lock()
 _trial_active     = False
 _trial_start_offset: float | None = None
 _trial_buffers = {
-    # imu and watch_audio arrive in network batches with inherent latency, so
-    # they are handled separately via rolling buffers (_imu_rolling,
-    # _watch_audio_rolling; see below). Only fingertip and mic — which have no
-    # such latency — are gated directly by the touch state and buffered here.
-    'fingertip':   [],   # FingertipIMURecord objects, as-is
-    'mic':         [],   # (ts, np.ndarray float32)
-    'trajectory':  [],   # (ts, trajectory dict from compute_trajectory())
+    # imu, watch_audio, fingertip, and trajectory all arrive with real
+    # processing latency (network batches for the watch streams; an extra
+    # camera-subprocess -> queue -> bridge-thread hop for fingertip/
+    # trajectory), so all four are handled via rolling buffers instead
+    # (_imu_rolling, _watch_audio_rolling, _fingertip_rolling,
+    # _trajectory_rolling; see below) snapshotted post-grace-period in
+    # _trial_worker_fn, not gated live by touch state here. Only mic — which
+    # arrives directly in this process via a real-time audio callback, with
+    # no such lag — is gated directly by the touch state and buffered here.
+    'mic': [],   # (ts, np.ndarray float32)
 }
 _trial_queue: "queue.Queue" = queue.Queue()   # carries (start_offset, end_offset, snapshot)
 _mic_sr_runtime: int = 192000   # updated in main() to the actual mic sample rate in use
@@ -200,14 +213,19 @@ _mic_sr_runtime: int = 192000   # updated in main() to the actual mic sample rat
 _pending_lock:   threading.Lock = threading.Lock()
 _pending_starts: list = []
 
-# ── IMU / watch-audio rolling buffers ──────────────────────────────────────────
+# ── IMU / watch-audio / fingertip / trajectory rolling buffers ─────────────────
 # Watch IMU/audio are transmitted in network batches and always arrive with some
-# delay. Gating them purely by _trial_active would silently drop samples that
-# were captured just before touch_up but hadn't arrived yet (this was the cause
-# of IMU trials being systematically shorter than fingertip trials). Instead,
-# these streams are buffered continuously regardless of touch state, and after
-# touch_up we wait out a grace period before extracting the [trial_start,
-# trial_end] window from the rolling buffer.
+# delay; fingertip/trajectory go through an extra camera-subprocess -> queue ->
+# bridge-thread hop that can lag behind real time under load (MediaPipe
+# inference, --show-camera drawing, etc). Gating any of these purely by
+# _trial_active — checked at the moment each item is finally processed, not
+# when it was captured — silently drops (or in the fingertip/trajectory case,
+# can drop *all* of) a trial's data once that processing lag exceeds the
+# trial's own duration, since by the time the item is processed _trial_active
+# has already flipped back to False. Instead, all four streams are buffered
+# continuously regardless of touch state, and after touch_up we wait out a
+# grace period before extracting the [trial_start, trial_end] window from the
+# rolling buffer.
 #
 # If trials are queued faster than the worker can process them, pruning by
 # ROLLING_RETENTION_SEC alone could delete a still-pending trial's data before
@@ -219,9 +237,23 @@ ROLLING_RETENTION_SEC = 30.0   # hard upper bound on rolling buffer age (safety 
 IMU_GRACE_SEC         = 0.5    # time to wait after touch_up for pending IMU batches to arrive (sec)
 WATCH_AUDIO_GRACE_SEC = 0.5    # time to wait after touch_up for pending watch-audio batches to arrive (sec)
 
+# Fingertip/trajectory go through camera-subprocess -> queue -> bridge-thread,
+# whose lag is much larger and more variable than network delay (MediaPipe
+# inference + --show-camera drawing under load can put it seconds behind real
+# time) — a single fixed short sleep like IMU/WATCH_AUDIO_GRACE_SEC isn't
+# reliable here; it was tried first and still produced empty fingertip/
+# trajectory trial data whenever the camera pipeline's actual backlog
+# exceeded that fixed wait. Poll until the rolling buffer has genuinely
+# caught up to this trial's own end time instead, capped by CAM_MAX_WAIT_SEC
+# so a stalled/dead camera process can't hang trial processing forever.
+CAM_CATCHUP_POLL_SEC = 0.05
+CAM_MAX_WAIT_SEC      = 5.0
+
 _rolling_lock: threading.Lock = threading.Lock()
 _imu_rolling:         "deque" = deque()   # (ts, sensor, v1, v2, v3, watch_ts_ms)
 _watch_audio_rolling: "deque" = deque()   # (ts, raw_bytes, watch_ts_ms)
+_fingertip_rolling:   "deque" = deque()   # FingertipIMURecord objects, as-is
+_trajectory_rolling:  "deque" = deque()   # (ts, trajectory dict from compute_trajectory())
 
 # Live trial-saving configuration — updated from CLI args in main()
 _trial_label:        str  = ''            # class label being repeated in this session (reuses --label)
@@ -276,7 +308,7 @@ def _rolling_cutoff(now_ts: float) -> float:
 
 # ─── Session management ─────────────────────────────────────────────────────────
 def start_session(label: str = '') -> Path:
-    global _session_dir, _session_start
+    global _session_dir, _session_start, _session_start_wall
     global _watch_wf, _mic_wf, _imu_fp, _imu_writer
     global _cam_fp, _cam_writer
     global _traj_fp, _traj_writer
@@ -289,6 +321,7 @@ def start_session(label: str = '') -> Path:
     _session_dir   = DATA_ROOT / name
     _session_dir.mkdir(parents=True, exist_ok=True)
     _session_start = time.perf_counter()
+    _session_start_wall = time.time()
 
     _watch_audio_offset = None
     _mic_offset         = None
@@ -628,9 +661,14 @@ def _write_fingertip_imu(records: list):
             if _cam_flush_n % CAM_FLUSH_EVERY_N == 0 and _cam_fp:
                 _cam_fp.flush()
 
-    with _trial_lock:   # live trial buffering
-        if _trial_active:
-            _trial_buffers['fingertip'].extend(records)
+    with _rolling_lock:   # rolling buffer filled regardless of touch state — see
+                          # comment above _imu_rolling for why this can't be
+                          # gated live by _trial_active
+        for r in records:
+            _fingertip_rolling.append(r)
+        cutoff = _rolling_cutoff(_offset())
+        while _fingertip_rolling and _fingertip_rolling[0].timestamp < cutoff:
+            _fingertip_rolling.popleft()
 
 
 # ─── Index-finger trajectory writer ─────────────────────────────────────────────
@@ -647,9 +685,13 @@ def _write_trajectory(traj: dict):
             if _traj_flush_n % CAM_FLUSH_EVERY_N == 0 and _traj_fp:
                 _traj_fp.flush()
 
-    with _trial_lock:   # live trial buffering
-        if _trial_active:
-            _trial_buffers['trajectory'].append((ts, traj))
+    with _rolling_lock:   # rolling buffer filled regardless of touch state — see
+                          # comment above _imu_rolling for why this can't be
+                          # gated live by _trial_active
+        _trajectory_rolling.append((ts, traj))
+        cutoff = _rolling_cutoff(_offset())
+        while _trajectory_rolling and _trajectory_rolling[0][0] < cutoff:
+            _trajectory_rolling.popleft()
 
 
 # ─── Spacebar touch-down/up marking ─────────────────────────────────────────────
@@ -705,13 +747,37 @@ def _on_key_release(key):
         return False   # stop the listener
 
 
+def _wait_for_camera_catchup(target_ts: float):
+    """Polls until the fingertip/trajectory rolling buffers' most recent
+    entry is at or past target_ts (meaning the camera pipeline's backlog has
+    caught up to at least this trial's own end), or gives up after
+    CAM_MAX_WAIT_SEC and proceeds with whatever's available — logging a
+    warning, since that means this trial's fingertip/trajectory data may
+    still come out incomplete."""
+    deadline = time.time() + CAM_MAX_WAIT_SEC
+    while time.time() < deadline:
+        with _rolling_lock:
+            ft_ts   = _fingertip_rolling[-1].timestamp if _fingertip_rolling else None
+            traj_ts = _trajectory_rolling[-1][0] if _trajectory_rolling else None
+        if ft_ts is not None and ft_ts >= target_ts and traj_ts is not None and traj_ts >= target_ts:
+            return
+        time.sleep(CAM_CATCHUP_POLL_SEC)
+    _log('TRIAL', f'camera pipeline had not caught up to this trial\'s end after '
+                  f'{CAM_MAX_WAIT_SEC}s — fingertip/trajectory data for it may be incomplete')
+
+
 # ─── Live trial processing worker ───────────────────────────────────────────────
 #
 # For each (start, end, snapshot) delivered via the queue at touch_up:
-#   0) Watch IMU/audio arrive with batch transmission delay, so processing
-#      immediately after touch_up would drop the tail end that hasn't arrived
-#      yet. We wait out the grace period, then extract the [start, end]
-#      window from the rolling buffers (_imu_rolling, _watch_audio_rolling).
+#   0) Watch IMU/audio arrive with batch transmission delay, so we wait out a
+#      short fixed grace period for those. Fingertip/trajectory arrive via an
+#      extra camera-subprocess -> queue -> bridge-thread hop whose lag is
+#      larger and more variable (MediaPipe inference + --show-camera drawing
+#      under load), so instead of a fixed sleep we poll until that pipeline
+#      has actually caught up to this trial's own end (see
+#      _wait_for_camera_catchup) before reading the [start, end] window from
+#      the rolling buffers (_imu_rolling, _watch_audio_rolling,
+#      _fingertip_rolling, _trajectory_rolling).
 #   1) Re-normalize each stream's timestamps relative to the trial start
 #      (starting from 0).
 #   2) Resample the surface mic to the watch audio sample rate.
@@ -727,10 +793,15 @@ def _trial_worker_fn():
 
         # Allow time for delayed watch IMU/audio batches to arrive
         time.sleep(max(IMU_GRACE_SEC, WATCH_AUDIO_GRACE_SEC))
+        # Wait for the fingertip/trajectory pipeline specifically to catch up
+        # to this trial's own end, however long that actually takes
+        _wait_for_camera_catchup(end)
 
         with _rolling_lock:
             snapshot['imu']         = list(_imu_rolling)
             snapshot['watch_audio'] = list(_watch_audio_rolling)
+            snapshot['fingertip']   = list(_fingertip_rolling)
+            snapshot['trajectory']  = list(_trajectory_rolling)
 
         with _pending_lock:   # this trial's data is now safely copied out; stop protecting it
             if start in _pending_starts:
@@ -965,7 +1036,7 @@ def _mic_callback(indata, frames, time_info, status):
 # locks wouldn't actually be shared anyway.
 def _camera_process_fn(camera_index: int, show_window: bool,
                         camera_pitch_deg, camera_roll_deg: float,
-                        session_start: float,
+                        session_start_wall: float,
                         record_queue: "mp.Queue", frame_queue,
                         stop_flag: "mp.Event", calibration: dict | None):
     import cv2 as _cv2
@@ -987,18 +1058,21 @@ def _camera_process_fn(camera_index: int, show_window: bool,
         record_queue.put(None)   # tells the main process the camera failed to open
         return
 
+    trail = deque(maxlen=TRAJ_TRAIL_MAXLEN)   # index-finger 2D trail, preview only
+
     while not stop_flag.is_set():
         success, frame = cap.read()
         if not success:
             continue
         frame = _cv2.flip(frame, 1)
         h, w = frame.shape[:2]
-        # time.perf_counter() is backed by a machine-wide monotonic clock (on
-        # POSIX, CLOCK_MONOTONIC; on Windows, QueryPerformanceCounter — both
-        # shared across processes, not per-process), so subtracting the same
-        # session_start value captured in the main process keeps this
-        # timestamp on the same timeline as _offset() there.
-        ts = time.perf_counter() - session_start
+        # time.time() (wall clock, seconds since epoch) means the same thing
+        # in every process on the machine, unlike perf_counter() — whose docs
+        # only guarantee monotonicity *within* a process, not a shared epoch
+        # across processes. Subtracting the wall-clock reference captured in
+        # the main process keeps this timestamp on the same timeline as
+        # _offset() there.
+        ts = time.time() - session_start_wall
         records = tracker.update(frame, timestamp=ts)
         traj = compute_trajectory(tracker, records, w, h, calibration)
         try:
@@ -1009,6 +1083,20 @@ def _camera_process_fn(camera_index: int, show_window: bool,
         if show_window and frame_queue is not None:
             tracker.draw(frame)
             tracker.draw_axes(frame)
+
+            if traj['x_px'] is not None:
+                trail.append((traj['x_px'], traj['y_px']))
+            # Fading trail: older points drawn thinner and dimmer (same style
+            # as index_trajectory_viewer.py's standalone preview).
+            n = len(trail)
+            for i in range(1, n):
+                alpha = i / n
+                thickness = max(1, int(alpha * 4))
+                color = tuple(int(c * alpha) for c in TRAJ_TRAIL_COLOR)
+                _cv2.line(frame, trail[i - 1], trail[i], color, thickness)
+            if trail:
+                _cv2.circle(frame, trail[-1], 6, TRAJ_TRAIL_COLOR, -1)
+
             if frame_queue.full():
                 try:
                     frame_queue.get_nowait()
@@ -1250,11 +1338,16 @@ def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue"):
                 continue
             frame = _cv2.flip(frame, 1)
             tracker.update(frame, timestamp=time.perf_counter())
-            tracker.draw(frame)
-            _cv2.putText(frame, "press 'c' to calibrate, any other key to start recording",
-                         (10, frame.shape[0] - 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+            # Draw the live-preview overlay on a copy, not `frame` itself —
+            # `frame` (unannotated) is what gets passed into calibration
+            # below, so its own on-screen prompts don't end up overlapping
+            # this loop's "press c to calibrate" reminder text.
+            display = frame.copy()
+            tracker.draw(display)
+            _cv2.putText(display, "press 'c' to calibrate, any other key to start recording",
+                         (10, display.shape[0] - 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                          (0, 255, 255), 1, _cv2.LINE_AA)
-            _cv2.imshow(window_name, frame)
+            _cv2.imshow(window_name, display)
             key = _cv2.waitKey(20) & 0xFF
             if key == ord('c'):
                 new_calibration = _run_calibration(tracker, frame, window_name)
@@ -1418,7 +1511,7 @@ def main():
         cam_proc = mp.Process(
             target=_camera_process_fn,
             args=(args.camera_index, args.show_camera, args.camera_pitch_deg, args.camera_roll_deg,
-                  _session_start, record_queue, frame_queue, cam_stop_flag, _calibration),
+                  _session_start_wall, record_queue, frame_queue, cam_stop_flag, _calibration),
             daemon=True,
         )
         cam_proc.start()
