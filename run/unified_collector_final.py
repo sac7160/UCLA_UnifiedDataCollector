@@ -9,12 +9,20 @@ Collected data streams:
   2) Watch IMU acc/gyro         → imu.csv
   3) Surface Mic        192kHz → surface_mic.wav
   4) Fingertip virtual IMU (5 fingers, accel/gyro) → fingertip_imu.csv
-  5) Spacebar touch-down/up marking            → events.csv
-  6) Sync info                  → sync.json
+  5) Index-finger 2D/3D/global trajectory          → trajectory.csv
+  6) Spacebar touch-down/up marking            → events.csv
+  7) Sync info                  → sync.json
+
+Trajectory calibration (see trajectory_calibration.py):
+  Runs once, interactively, before each session starts (before the camera
+  subprocess opens the device) — reuses a saved calibration.json if present,
+  press 'c' to (re)calibrate, any other key to start recording. Pass
+  --skip-calibration to bypass the prompt entirely (silently reuses
+  calibration.json if present, else records uncalibrated trajectory values).
 
 Sync:
   Common reference clock via time.perf_counter() (shared across all streams,
-  including the fingertip IMU).
+  including the fingertip IMU and trajectory).
   The first-received timestamp of each stream is recorded as an offset (in
   seconds) relative to session_start.
 
@@ -25,8 +33,15 @@ Storage layout:
   ├── imu.csv              (timestamp_sec, sensor, v1, v2, v3, watch_ts_ms)
   ├── fingertip_imu.csv    (timestamp_sec, finger, hand_label, detected,
   │                         accel_x/y/z, gyro_x/y/z, pos_x/y/z)
+  ├── trajectory.csv       (timestamp_sec, detected, x_px, y_px, x_norm, y_norm,
+  │                         pos_x/y/z_mm, local_x/y/z_mm, calibrated,
+  │                         global_x/y_mm, height_mm, frame_x/y_mm)
   ├── events.csv           (timestamp_sec, event: touch_down/touch_up)
   └── sync.json
+
+  dataset/<label>/trial_NNN/ additionally gets a per-trial trajectory.csv
+  (same columns, time_aligned to the trial's own start) alongside the
+  existing imu.csv/fingertip_imu.csv/watch_audio.wav/surface_mic.wav.
 
 Usage:
     python unified_collector.py
@@ -34,7 +49,8 @@ Usage:
     python unified_collector.py --mic-device 1 --mic-channel 1
     python unified_collector.py --list-devices
     python unified_collector.py --camera-index 0 --show-camera      # enable camera preview window
-    python unified_collector.py --no-camera                         # disable camera (fingertip IMU)
+    python unified_collector.py --no-camera                         # disable camera (fingertip IMU + trajectory)
+    python unified_collector.py --skip-calibration                  # bypass the interactive calibration prompt
     python unified_collector.py --camera-pitch-deg 30                # 30-degree downward camera tilt → gravity compensation
     python unified_collector.py --label line_horizontal --dataset-root dataset/   # set label/path for live trial saving
     python unified_collector.py --label line_horizontal --trial-margin 0.15        # adjust margin
@@ -65,9 +81,13 @@ import scipy.io.wavfile as wavfile
 from pynput import keyboard
 from scipy.signal import butter, sosfilt, sosfilt_zi, resample_poly
 
-# Note: MultiFingertipIMUTracker / gravity_vector_from_camera_tilt are
-# imported inside _camera_process_fn instead of here, since that code now
-# runs in a separate process (see the comment above that function).
+from trajectory_calibration import load_calibration, trajectory_csv_row, TRAJECTORY_CSV_HEADER
+
+# Note: MultiFingertipIMUTracker / gravity_vector_from_camera_tilt /
+# compute_trajectory / run_calibration are imported inside
+# _camera_process_fn / _run_precalibration_process instead of here, since
+# that code now runs in a separate process (see the comments above each
+# function).
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 WATCH_HOST       = '0.0.0.0'
@@ -122,6 +142,16 @@ _cam_flush_n = 0
 # Note: the camera + MediaPipe tracker no longer live in this process at all
 # (see _camera_process_fn) — there's nothing to hold a reference to here.
 
+_traj_fp      = None   # trajectory.csv file handle (index-finger 2D/3D/global trajectory)
+_traj_writer  = None
+_traj_flush_n = 0
+
+# Calibration for trajectory tracking (see trajectory_calibration.py) — loaded
+# or interactively (re)established once before recording starts (main()),
+# then passed as a plain dict into _camera_process_fn since that process gets
+# its own fresh module state under 'spawn' and can't read this global.
+_calibration: dict | None = None
+
 _events_fp     = None   # events.csv file handle for spacebar down/up marking
 _events_writer = None
 _space_down    = False  # guards against key auto-repeat firing multiple events
@@ -151,6 +181,7 @@ _trial_buffers = {
     # such latency — are gated directly by the touch state and buffered here.
     'fingertip':   [],   # FingertipIMURecord objects, as-is
     'mic':         [],   # (ts, np.ndarray float32)
+    'trajectory':  [],   # (ts, trajectory dict from compute_trajectory())
 }
 _trial_queue: "queue.Queue" = queue.Queue()   # carries (start_offset, end_offset, snapshot)
 _mic_sr_runtime: int = 192000   # updated in main() to the actual mic sample rate in use
@@ -248,6 +279,7 @@ def start_session(label: str = '') -> Path:
     global _session_dir, _session_start
     global _watch_wf, _mic_wf, _imu_fp, _imu_writer
     global _cam_fp, _cam_writer
+    global _traj_fp, _traj_writer
     global _events_fp, _events_writer
     global _watch_audio_frames_fp, _watch_audio_frames_writer, _watch_audio_session_samples
     global _watch_audio_offset, _mic_offset, _imu_offset, _cam_offset, _sync
@@ -283,6 +315,11 @@ def start_session(label: str = '') -> Path:
         'pos_x', 'pos_y', 'pos_z',
     ])
 
+    # Index-finger 2D/3D/global trajectory (see trajectory_calibration.py)
+    _traj_fp     = open(_session_dir / 'trajectory.csv', 'w', newline='')
+    _traj_writer = csv.writer(_traj_fp)
+    _traj_writer.writerow(TRAJECTORY_CSV_HEADER)
+
     # Spacebar touch-down/up marking
     _events_fp     = open(_session_dir / 'events.csv', 'w', newline='')
     _events_writer = csv.writer(_events_fp)
@@ -313,7 +350,7 @@ def start_session(label: str = '') -> Path:
 
 
 def close_session():
-    global _watch_wf, _mic_wf, _imu_fp, _cam_fp, _events_fp, _watch_audio_frames_fp
+    global _watch_wf, _mic_wf, _imu_fp, _cam_fp, _traj_fp, _events_fp, _watch_audio_frames_fp
 
     for wf in [_watch_wf, _mic_wf]:
         if wf:
@@ -327,6 +364,10 @@ def close_session():
     if _cam_fp:
         _cam_fp.close()
         _cam_fp = None
+
+    if _traj_fp:
+        _traj_fp.close()
+        _traj_fp = None
 
     if _events_fp:
         _events_fp.close()
@@ -592,6 +633,25 @@ def _write_fingertip_imu(records: list):
             _trial_buffers['fingertip'].extend(records)
 
 
+# ─── Index-finger trajectory writer ─────────────────────────────────────────────
+def _write_trajectory(traj: dict):
+    """traj: dict returned by trajectory_calibration.compute_trajectory() for
+    one frame. Uses the index record's own timestamp (same per-frame value
+    already shared by every FingertipIMURecord in that frame's `records`)."""
+    global _traj_flush_n
+    ts = traj['index_record'].timestamp
+    with _lock:
+        if _traj_writer:
+            _traj_writer.writerow(trajectory_csv_row(ts, traj))
+            _traj_flush_n += 1
+            if _traj_flush_n % CAM_FLUSH_EVERY_N == 0 and _traj_fp:
+                _traj_fp.flush()
+
+    with _trial_lock:   # live trial buffering
+        if _trial_active:
+            _trial_buffers['trajectory'].append((ts, traj))
+
+
 # ─── Spacebar touch-down/up marking ─────────────────────────────────────────────
 #
 # The watch sends a fixed 3-second stream at acquisition start and has no way
@@ -727,6 +787,15 @@ def process_trial(start: float, end: float, snapshot: dict):
         if trial_start <= r.timestamp <= trial_end
     ]
 
+    # Crop index-finger trajectory + re-normalize to time_aligned. Comes from
+    # the same camera/PC-clock source as fingertip data above, so it doesn't
+    # need RTBGN watch-clock alignment either.
+    traj_rel = [
+        (ts - trial_start, traj)
+        for (ts, traj) in snapshot['trajectory']
+        if trial_start <= ts <= trial_end
+    ]
+
     if not imu_rel and not ft_rel:
         _log('TRIAL', 'no valid samples remain after applying margin, skipping')
         return
@@ -794,6 +863,12 @@ def process_trial(start: float, end: float, snapshot: dict):
                         f'{gx:.6f}', f'{gy:.6f}', f'{gz:.6f}',
                         f'{px:.3f}', f'{py:.3f}', f'{pz:.3f}'])
 
+    with open(trial_dir / 'trajectory.csv', 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(TRAJECTORY_CSV_HEADER)
+        for ta, traj in sorted(traj_rel, key=lambda row: row[0]):
+            w.writerow(trajectory_csv_row(ta, traj))
+
     # Append to metadata.csv (write header if it doesn't exist yet)
     metadata_path = _trial_dataset_root / 'metadata.csv'
     write_header = not metadata_path.exists()
@@ -812,7 +887,7 @@ def process_trial(start: float, end: float, snapshot: dict):
     _log(
         'TRIAL',
         f'saved → {trial_dir}  duration={trial_end-trial_start:.3f}s  '
-        f'imu={len(imu_rel)}  fingertip={len(ft_rel)}  '
+        f'imu={len(imu_rel)}  fingertip={len(ft_rel)}  trajectory={len(traj_rel)}  '
         f'watch_audio={len(wa_samples)}samples  mic={len(mic_int16)}samples',
     )
 
@@ -892,9 +967,10 @@ def _camera_process_fn(camera_index: int, show_window: bool,
                         camera_pitch_deg, camera_roll_deg: float,
                         session_start: float,
                         record_queue: "mp.Queue", frame_queue,
-                        stop_flag: "mp.Event"):
+                        stop_flag: "mp.Event", calibration: dict | None):
     import cv2 as _cv2
     from fingertip_imu_multi import MultiFingertipIMUTracker, gravity_vector_from_camera_tilt
+    from trajectory_calibration import compute_trajectory
 
     gravity_mm_s2 = None
     if camera_pitch_deg is not None:
@@ -916,6 +992,7 @@ def _camera_process_fn(camera_index: int, show_window: bool,
         if not success:
             continue
         frame = _cv2.flip(frame, 1)
+        h, w = frame.shape[:2]
         # time.perf_counter() is backed by a machine-wide monotonic clock (on
         # POSIX, CLOCK_MONOTONIC; on Windows, QueryPerformanceCounter — both
         # shared across processes, not per-process), so subtracting the same
@@ -923,8 +1000,9 @@ def _camera_process_fn(camera_index: int, show_window: bool,
         # timestamp on the same timeline as _offset() there.
         ts = time.perf_counter() - session_start
         records = tracker.update(frame, timestamp=ts)
+        traj = compute_trajectory(tracker, records, w, h, calibration)
         try:
-            record_queue.put_nowait(records)
+            record_queue.put_nowait((records, traj))
         except Exception:
             pass   # main process fell behind — drop this frame's records rather than block capture
 
@@ -946,20 +1024,23 @@ def _camera_process_fn(camera_index: int, show_window: bool,
 
 
 def _camera_bridge_thread_fn(record_queue: "mp.Queue"):
-    """Pulls fingertip IMU records off the queue fed by the camera process and
-    writes them exactly as _camera_thread_fn used to. This thread does no
-    CPU-heavy work of its own — the MediaPipe inference already happened in
-    the child process — so it doesn't meaningfully compete for the GIL with
-    the audio/network threads the way the old in-process camera thread did."""
+    """Pulls (fingertip IMU records, trajectory dict) pairs off the queue fed
+    by the camera process and writes them exactly as _camera_thread_fn used
+    to. This thread does no CPU-heavy work of its own — the MediaPipe
+    inference already happened in the child process — so it doesn't
+    meaningfully compete for the GIL with the audio/network threads the way
+    the old in-process camera thread did."""
     while not stop_event.is_set():
         try:
-            records = record_queue.get(timeout=0.2)
+            payload = record_queue.get(timeout=0.2)
         except queue.Empty:
             continue
-        if records is None:
+        if payload is None:
             _log('CAM', 'camera process reported it could not open the camera')
             continue
+        records, traj = payload
         _write_fingertip_imu(records)
+        _write_trajectory(traj)
 
 
 # ─── TCP net thread ───────────────────────────────────────────────────────────────
@@ -1125,6 +1206,71 @@ def _bar(rms: float, scale: float, width: int = 20) -> str:
     return '█' * filled + '░' * (width - filled)
 
 
+def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue"):
+    """Runs the interactive trajectory calibration (see trajectory_calibration.py)
+    in its own OS process, fully isolated from the main process — a temporary
+    VideoCapture + OpenCV GUI window here previously ran in the main process
+    itself, which turned out to destabilize it once pynput's keyboard
+    listener started up right afterward (both touch low-level macOS
+    frameworks in the same process; this showed up as a native 'trace trap'
+    crash right at key_listener.start()). Running it here instead means the
+    main process never touches OpenCV's GUI at all, and the OS fully
+    reclaims the camera device the moment this process exits — before the
+    real camera subprocess opens it. Puts the resulting calibration dict (or
+    None) on result_queue once done.
+
+    Loads an existing calibration.json if present; press 'c' to
+    (re)calibrate, any other key to finish and let main() proceed to
+    recording with whatever calibration (if any) is active."""
+    import cv2 as _cv2
+    from fingertip_imu_multi import MultiFingertipIMUTracker
+    from trajectory_calibration import load_calibration as _load_calibration, run_calibration as _run_calibration
+
+    calibration = _load_calibration()
+    if calibration is not None:
+        print(f'[CALIBRATE] loaded existing calibration from {calibration.get("timestamp", "?")} '
+              f'(scale_factor={calibration.get("scale_factor"):.4f})')
+
+    cap = _cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print(f'[CALIBRATE] could not open camera index={camera_index} for pre-recording calibration '
+              f'— continuing with {"loaded" if calibration else "no"} calibration')
+        result_queue.put(calibration)
+        return
+
+    window_name = 'Trajectory Calibration'
+    _cv2.namedWindow(window_name)
+    tracker = MultiFingertipIMUTracker(max_num_hands=1)
+    print("[CALIBRATE] press 'c' to (re)calibrate trajectory tracking, any other key to start recording")
+
+    try:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                continue
+            frame = _cv2.flip(frame, 1)
+            tracker.update(frame, timestamp=time.perf_counter())
+            tracker.draw(frame)
+            _cv2.putText(frame, "press 'c' to calibrate, any other key to start recording",
+                         (10, frame.shape[0] - 20), _cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                         (0, 255, 255), 1, _cv2.LINE_AA)
+            _cv2.imshow(window_name, frame)
+            key = _cv2.waitKey(20) & 0xFF
+            if key == ord('c'):
+                new_calibration = _run_calibration(tracker, frame, window_name)
+                if new_calibration is not None:
+                    calibration = new_calibration
+                continue
+            if key != 255:   # any real key press other than 'c' (255 = none this poll)
+                break
+    finally:
+        cap.release()
+        _cv2.destroyAllWindows()
+        tracker.close()
+
+    result_queue.put(calibration)
+
+
 def main():
     global MIC_TARGET_CH, MIC_GAIN
 
@@ -1150,6 +1296,10 @@ def main():
     parser.add_argument('--camera-pitch-deg', type=float, default=None,
                          help='downward camera tilt angle; if set, applies gravity compensation')
     parser.add_argument('--camera-roll-deg',  type=float, default=0.0)
+    parser.add_argument('--skip-calibration', action='store_true',
+                         help="skip the interactive pre-recording trajectory calibration prompt "
+                              "(just silently reuses calibration.json if it exists, else records "
+                              "uncalibrated trajectory values)")
     # Live trial-saving options
     parser.add_argument('--dataset-root', type=Path, default=Path('dataset'),
                          help='root folder for live trial dataset saving (default: ./dataset)')
@@ -1203,6 +1353,29 @@ def main():
     print(f'[MIC] device=[{mic_device}] channels={args.mic_channels} '
           f'target_ch={MIC_TARGET_CH} sr={args.mic_sr}')
 
+    # Trajectory calibration happens before the session starts (and before
+    # the camera subprocess opens the device), so calibration time doesn't
+    # count toward the session clock and the two never fight over the camera.
+    global _calibration
+    if args.no_camera:
+        _calibration = None
+    elif args.skip_calibration:
+        _calibration = load_calibration()
+    else:
+        calib_result_queue: "mp.Queue" = mp.Queue()
+        calib_proc = mp.Process(
+            target=_run_precalibration_process,
+            args=(args.camera_index, calib_result_queue),
+        )
+        calib_proc.start()
+        calib_proc.join()
+        try:
+            _calibration = calib_result_queue.get_nowait()
+        except queue.Empty:
+            print('[CALIBRATE] calibration process exited without a result — '
+                  'continuing with any saved calibration')
+            _calibration = load_calibration()
+
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     start_session(label=args.label)
 
@@ -1245,7 +1418,7 @@ def main():
         cam_proc = mp.Process(
             target=_camera_process_fn,
             args=(args.camera_index, args.show_camera, args.camera_pitch_deg, args.camera_roll_deg,
-                  _session_start, record_queue, frame_queue, cam_stop_flag),
+                  _session_start, record_queue, frame_queue, cam_stop_flag, _calibration),
             daemon=True,
         )
         cam_proc.start()
