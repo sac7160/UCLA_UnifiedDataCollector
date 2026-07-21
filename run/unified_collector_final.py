@@ -40,6 +40,8 @@ Usage:
     python unified_collector.py --label line_horizontal --trial-margin 0.15        # adjust margin
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import json
@@ -1130,6 +1132,11 @@ def main():
     parser.add_argument('--label',        default='')
     parser.add_argument('--mic-device',   type=int,   default=None)
     parser.add_argument('--mic-channel',  type=int,   default=1)
+    parser.add_argument('--mic-channels', type=int,   default=MIC_CHANNELS,
+                         help=f'total input channel count to open on the mic device '
+                              f'(default {MIC_CHANNELS}, sized for a 4-channel interface like the '
+                              f'TASCAM US-4x4; set to your device\'s actual channel count, e.g. 2, '
+                              f'if PortAudio reports "Invalid number of channels")')
     parser.add_argument('--mic-sr',       type=int,   default=MIC_SR)
     parser.add_argument('--mic-gain',     type=float, default=1.0)
     parser.add_argument('--watch-port',   type=int,   default=WATCH_PORT)
@@ -1182,7 +1189,19 @@ def main():
         print('[MIC] No audio interface found. '
               'Specify one directly with --mic-device N (see --list-devices).')
         sys.exit(1)
-    print(f'[MIC] device=[{mic_device}] ch={MIC_TARGET_CH} sr={args.mic_sr}')
+
+    device_max_ch = sd.query_devices(mic_device)['max_input_channels']
+    if args.mic_channels > device_max_ch:
+        print(f'[MIC] --mic-channels={args.mic_channels} exceeds device [{mic_device}]\'s '
+              f'max_input_channels={device_max_ch}. Pass --mic-channels {device_max_ch} '
+              f'(see --list-devices for other options).')
+        sys.exit(1)
+    if MIC_TARGET_CH > args.mic_channels:
+        print(f'[MIC] --mic-channel={MIC_TARGET_CH} is out of range for '
+              f'--mic-channels={args.mic_channels}.')
+        sys.exit(1)
+    print(f'[MIC] device=[{mic_device}] channels={args.mic_channels} '
+          f'target_ch={MIC_TARGET_CH} sr={args.mic_sr}')
 
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     start_session(label=args.label)
@@ -1200,7 +1219,7 @@ def main():
 
     mic_stream = sd.InputStream(
         device=mic_device,
-        channels=MIC_CHANNELS,
+        channels=args.mic_channels,
         samplerate=args.mic_sr,
         blocksize=MIC_BLOCK_SIZE,
         dtype='float32',
