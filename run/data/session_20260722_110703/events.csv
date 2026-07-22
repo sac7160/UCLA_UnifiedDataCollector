@@ -1,0 +1,17 @@
+timestamp_sec,event
+0.002328,material:wood
+5.158770,material:acrylic
+22.143039,rec_start
+24.054372,audio_touch_on
+24.329622,audio_touch_off
+24.757256,audio_touch_on
+25.859400,audio_touch_off
+26.700689,rec_end
+30.039581,rec_start
+31.393868,audio_touch_on
+31.691357,audio_touch_off
+32.076858,audio_touch_on
+32.559245,audio_touch_off
+32.826544,audio_touch_on
+33.141849,audio_touch_off
+34.271685,rec_end

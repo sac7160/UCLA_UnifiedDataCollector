@@ -21,8 +21,10 @@ dataset/<label>/.
 """
 
 import csv
+import json
 import queue
 import time
+from datetime import datetime
 from math import gcd
 
 import numpy as np
@@ -66,8 +68,10 @@ def toggle_recording():
     touch_detection.audio_worker_fn), but those no longer trim the saved
     trial's boundaries; they're just timestamps recorded alongside it."""
     if not state.rec_active:
-        state.current_label = state.label_getter() if state.label_getter else ''
-        state.current_stimulus = state.current_label   # shown big on the experimenter window
+        # state.current_label/current_stimulus are kept up to date live by
+        # the instructor window's class-picker dropdown — nothing to pull
+        # here at REC-start anymore, they're already whatever was last
+        # selected.
         write_event('rec_start')
         with state.trial_lock:
             for k in state.trial_buffers:
@@ -300,3 +304,30 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
             f'{trial_start:.6f}', f'{trial_end:.6f}',
             f'{trial_end - trial_start:.6f}', margin, trigger, state.current_material,
         ])
+
+    # Same info as the metadata.csv row above, but living *inside* the
+    # trial's own folder — so opening trial_XXX/ alone (without cross-
+    # referencing the dataset-wide metadata.csv) is enough to know when it
+    # was collected and what material was active. collected_at is a real
+    # wall-clock timestamp: session_start_epoch (time.time(), captured at
+    # start_session()) plus trial_start (a perf_counter()-based offset from
+    # that same moment) — see session.py's sync dict.
+    session_start_epoch = state.sync.get('session_start_epoch')
+    if session_start_epoch is not None:
+        collected_at = datetime.fromtimestamp(session_start_epoch + trial_start).strftime('%Y-%m-%d %H:%M:%S')
+    else:
+        collected_at = None
+    trial_info = {
+        'session': state.session_dir.name if state.session_dir else '',
+        'label': label_use,
+        'trial_idx': trial_idx,
+        'trigger': trigger,
+        'material': state.current_material,
+        'collected_at': collected_at,
+        'start_sec': round(trial_start, 6),
+        'end_sec': round(trial_end, 6),
+        'duration_sec': round(trial_end - trial_start, 6),
+        'margin_sec': margin,
+    }
+    with open(trial_dir / 'trial_info.json', 'w') as f:
+        json.dump(trial_info, f, indent=2)

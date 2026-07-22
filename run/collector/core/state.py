@@ -110,8 +110,7 @@ mic_sr_runtime: int = config.MIC_SR          # updated in main() to the actual m
 
 rec_active: bool = False
 audio_touch_start: float | None = None   # set while a touch is in progress during REC — see touch_detection.py
-current_label: str = ''         # captured at REC-start; see trial.toggle_recording()
-label_getter = None              # callable set in main() -> instructor window's current label text
+current_label: str = ''         # kept live by the instructor window's class-picker dropdown
 
 pending_starts: list = []
 
@@ -177,6 +176,5 @@ mic_wav_queue:       "queue.Queue" = queue.Queue()   # raw int16 PCM bytes -> mi
 watch_audio_queue:   "queue.Queue" = queue.Queue()   # (payload, arrival_pc) or ('__RTEND__', ts) -> watch audio worker
 watch_imu_queue:     "queue.Queue" = queue.Queue()   # (payload, sensor, arrival_pc) -> watch IMU worker
 
-# ─── Instructor -> experimenter shared text (gui.py) ─────────────────────────
-current_instruction: str = ''
+# ─── Instructor -> experimenter shared text ──────────────────────────────────
 current_stimulus: str = ''   # what the experimenter should write right now
