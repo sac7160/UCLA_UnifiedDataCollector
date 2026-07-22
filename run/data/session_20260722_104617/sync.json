@@ -1,0 +1,14 @@
+{
+  "session_start_epoch": 1784742377.918818,
+  "label": "",
+  "watch_audio_sr": 48000,
+  "surface_mic_sr": 192000,
+  "watch_audio_offset_sec": null,
+  "surface_mic_offset_sec": 0.2734983789268881,
+  "imu_offset_sec": null,
+  "fingertip_imu_offset_sec": 5.891454534023069,
+  "rtbgn_watch_ms": null,
+  "rtbgn_pc_sec": null,
+  "rtend_watch_ms": null,
+  "rtend_pc_sec": null
+}

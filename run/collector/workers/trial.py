@@ -65,8 +65,10 @@ def toggle_recording():
     touch_detection.audio_worker_fn), but those no longer trim the saved
     trial's boundaries; they're just timestamps recorded alongside it."""
     if not state.rec_active:
-        state.current_label = state.label_getter() if state.label_getter else ''
-        state.current_stimulus = state.current_label   # shown big on the experimenter window
+        # state.current_label/current_stimulus are kept up to date live by
+        # the instructor window's class-picker dropdown — nothing to pull
+        # here at REC-start anymore, they're already whatever was last
+        # selected.
         write_event('rec_start')
         with state.trial_lock:
             for k in state.trial_buffers:

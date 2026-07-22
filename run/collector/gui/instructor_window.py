@@ -12,7 +12,7 @@ import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets
 
-from ..core import config, state
+from ..core import config, state, dataset_classes
 from ..workers.touch_detection import set_material
 from ..workers.trial import toggle_recording
 from .display_buffers import ScrollingSpectrogram
@@ -67,6 +67,20 @@ class InstructorWindow(QtWidgets.QMainWindow):
             btn.clicked.connect(lambda checked=False, n=name: self._on_material_clicked(n))
             meta_row.addWidget(btn)
         meta_row.addWidget(self.material_label)
+        meta_row.addSpacing(20)
+
+        meta_row.addWidget(QtWidgets.QLabel('class to write:'))
+        self.class_combo = QtWidgets.QComboBox()
+        self.class_combo.addItem('— select —', userData='')
+        for cls in dataset_classes.ALL_CLASSES:
+            self.class_combo.addItem(cls, userData=cls)
+        self.class_combo.setMinimumWidth(160)
+        self.class_combo.currentIndexChanged.connect(self._on_class_changed)
+        meta_row.addWidget(self.class_combo)
+        self.class_preview_label = QtWidgets.QLabel('')
+        self.class_preview_label.setStyleSheet('font-weight: bold; font-size: 16px; padding: 2px 8px;')
+        meta_row.addWidget(self.class_preview_label)
+
         meta_row.addStretch(1)
         outer.addLayout(meta_row)
 
@@ -226,6 +240,18 @@ class InstructorWindow(QtWidgets.QMainWindow):
         low, high = config.MATERIAL_PRESETS[name]
         self.material_label.setText(f'[{name}] {low:.0f}-{high:.0f}Hz')
         self._reset_minmax()   # old min/max is meaningless once the band changes
+
+    def _on_class_changed(self, index: int):
+        """Updates the live label/stimulus immediately — not just at
+        REC-start — so the experimenter window shows the right thing to
+        write before recording even begins. This directly replaces the
+        old --session-label CLI flag / label text field for per-trial
+        labeling; --session-label still exists, but now only names the
+        session folder (e.g. a participant ID), not what gets written."""
+        cls = self.class_combo.itemData(index)
+        state.current_label = cls
+        state.current_stimulus = cls
+        self.class_preview_label.setText(dataset_classes.display_text_for_label(cls) if cls else '')
 
     def _reset_minmax(self):
         self._metric_min = None

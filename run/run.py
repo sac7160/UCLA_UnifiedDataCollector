@@ -75,7 +75,11 @@ def main():
     parser.add_argument('--no-camera', action='store_true')
     parser.add_argument('--finger', choices=config.FINGER_NAMES, default='index')
     parser.add_argument('--dataset-root', type=Path, default=Path('dataset'))
-    parser.add_argument('--session-label', default='')
+    parser.add_argument('--session-label', default='',
+                         help='optional suffix for the session folder name (e.g. a participant ID) '
+                              '— data/session_YYYYMMDD_HHMMSS_<this>/. Does NOT set what gets '
+                              'written; that\'s chosen live from the instructor window\'s class '
+                              'dropdown, per trial.')
     parser.add_argument('--trial-margin', type=float, default=0.1)
     parser.add_argument('--material', choices=list(config.MATERIAL_PRESETS), default='wood')
     parser.add_argument('--touch-min-on-ms', type=float, default=config.TOUCH_MIN_ON_MS_DEFAULT)
@@ -205,10 +209,10 @@ def main():
 
     instructor = InstructorWindow(args.window_sec, has_camera=not args.no_camera,
                                    use_opengl=args.opengl)
-    # Label input was removed from the instructor window — the label for
-    # every trial this session is now fixed to whatever --session-label
-    # was passed at startup (empty -> saved under dataset/unlabeled/).
-    state.label_getter = lambda: args.session_label
+    # Per-trial labeling now comes from the instructor window's class-picker
+    # dropdown (see InstructorWindow._on_class_changed), not a CLI flag or
+    # text field — nothing to wire up here. --session-label still exists,
+    # but only names the session folder now (e.g. a participant ID).
 
     experimenter = ExperimenterWindow()
 
