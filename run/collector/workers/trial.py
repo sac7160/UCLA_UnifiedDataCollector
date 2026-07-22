@@ -274,7 +274,11 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
 
     with open(trial_dir / 'trajectory.csv', 'w', newline='') as f:
         w = csv.writer(f)
-        w.writerow(TRAJECTORY_CSV_HEADER)
+        # First column is 'time_aligned' here (not 'timestamp_sec' as in
+        # TRAJECTORY_CSV_HEADER) — same time_aligned convention as
+        # imu.csv/fingertip_imu.csv above (0 = this trial's start), matching
+        # trajectory_csv_row(ta, traj)'s actual first value.
+        w.writerow(['time_aligned'] + TRAJECTORY_CSV_HEADER[1:])
         for ta, traj in sorted(traj_rel, key=lambda row: row[0]):
             w.writerow(trajectory_csv_row(ta, traj))
 
