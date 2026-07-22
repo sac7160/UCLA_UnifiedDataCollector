@@ -11,6 +11,8 @@ Usage:
     python plot_imu_comparison.py --imu imu.csv --fingertip fingertip_imu.csv --save out.png
 """
 
+from __future__ import annotations
+
 import argparse
 
 import matplotlib.pyplot as plt

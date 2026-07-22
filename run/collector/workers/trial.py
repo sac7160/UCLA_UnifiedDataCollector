@@ -32,6 +32,7 @@ from scipy.signal import resample_poly
 
 from ..core import config, state
 from ..core.utils import log, offset
+from trajectory_calibration import TRAJECTORY_CSV_HEADER, trajectory_csv_row
 
 
 def write_event(event: str):
@@ -209,6 +210,12 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
         if trial_start <= r.timestamp <= trial_end
     ]
 
+    traj_rel = [
+        (traj['index_record'].timestamp - trial_start, traj)
+        for traj in snapshot.get('trajectory', [])
+        if trial_start <= traj['index_record'].timestamp <= trial_end
+    ]
+
     if not imu_rel and not ft_rel:
         return
 
@@ -260,6 +267,12 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
                         f'{ax:.4f}', f'{ay:.4f}', f'{az:.4f}',
                         f'{gx:.6f}', f'{gy:.6f}', f'{gz:.6f}',
                         f'{px:.3f}', f'{py:.3f}', f'{pz:.3f}'])
+
+    with open(trial_dir / 'trajectory.csv', 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(TRAJECTORY_CSV_HEADER)
+        for ta, traj in sorted(traj_rel, key=lambda row: row[0]):
+            w.writerow(trajectory_csv_row(ta, traj))
 
     # Same time_aligned convention as imu.csv/fingertip_imu.csv above (0 =
     # this trial's start) — session-level events.csv uses offset-from-

@@ -33,6 +33,9 @@ CAM_EMA_ALPHA        = 0.2
 CAM_FLUSH_EVERY_N    = 10
 FINGER_NAMES = ['thumb', 'index', 'middle', 'ring', 'pinky']
 
+# ─── Index-finger trajectory (see trajectory_calibration.py) ──────────────────
+TRAJ_TRAIL_MAXLEN = 150   # points kept for the instructor window's live trail plot
+
 # ─── Session / dataset ────────────────────────────────────────────────────────
 DATA_ROOT      = Path('data')
 SESSION_PREFIX = 'session'

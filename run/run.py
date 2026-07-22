@@ -13,24 +13,27 @@ the collector/ package next to this file, split into three subpackages
         utils.py               offset()/log() and the rolling-buffer cutoff helper
     collector/workers/
         session.py             session file lifecycle + post-hoc trial recalibration
-        writers.py              write_watch_audio / write_imu / write_fingertip_imu
+        writers.py              write_watch_audio / write_imu / write_fingertip_imu / write_trajectory
         touch_detection.py     mic callback + band-pass/calibration/threshold/debounce
         watch_network.py        watch TCP listener + packet parsing
-        camera.py                MediaPipe fingertip-IMU process + bridge thread
+        camera.py                MediaPipe fingertip-IMU + trajectory process + bridge thread
+        calibration.py           interactive index-fingertip trajectory calibration (subprocess)
         trial.py                 REC toggle, two-tier trial boundaries, trial cropping/saving
     collector/gui/
-        display_buffers.py       ScrollingWaveform/Spectrogram/IMU
+        display_buffers.py       ScrollingWaveform/Spectrogram/IMU/TrajectoryTrail
         instructor_window.py     InstructorWindow
         experimenter_window.py   ExperimenterWindow
 
-This file itself only does: argparse, opening the mic stream, starting
-every thread/process in the right order, building the two windows, and
-tearing everything down cleanly on exit.
+This file itself only does: argparse, running the pre-recording trajectory
+calibration prompt, opening the mic stream, starting every thread/process in
+the right order, building the two windows, and tearing everything down
+cleanly on exit.
 
 Usage:
     python run.py
     python run.py --mic-device 1 --mic-channel 1
     python run.py --dataset-root dataset/ --list-devices
+    python run.py --skip-calibration   # reuse calibration.json without the interactive prompt
 """
 
 import argparse
@@ -48,7 +51,8 @@ from pynput import keyboard
 
 from collector.core import config, state
 from collector.core.utils import install_stdout_tee
-from collector.gui.display_buffers import ScrollingWaveform, ScrollingSpectrogram, ScrollingIMU
+from collector.gui.display_buffers import ScrollingWaveform, ScrollingSpectrogram, ScrollingIMU, TrajectoryTrail
+from collector.workers.calibration import get_calibration
 from collector.workers.session import start_session, close_session
 from collector.workers.touch_detection import (
     mic_callback, mic_wav_writer_fn, audio_worker_fn, rebuild_touch_band_filter,
@@ -66,6 +70,11 @@ def main():
     parser = argparse.ArgumentParser(description='WristPad experiment collector')
     parser.add_argument('--mic-device', type=int, default=None)
     parser.add_argument('--mic-channel', type=int, default=1)
+    parser.add_argument('--mic-channels', type=int, default=config.MIC_CHANNELS,
+                         help=f'total input channel count to open on the mic device '
+                              f'(default {config.MIC_CHANNELS}, sized for a 4-channel interface like the '
+                              f'TASCAM US-4x4; set to your device\'s actual channel count, e.g. 2, '
+                              f'if PortAudio reports "Invalid number of channels")')
     parser.add_argument('--mic-sr', type=int, default=config.MIC_SR)
     parser.add_argument('--mic-gain', type=float, default=1.0)
     parser.add_argument('--watch-port', type=int, default=config.WATCH_PORT)
@@ -73,6 +82,10 @@ def main():
     parser.add_argument('--camera-pitch-deg', type=float, default=None)
     parser.add_argument('--camera-roll-deg', type=float, default=0.0)
     parser.add_argument('--no-camera', action='store_true')
+    parser.add_argument('--skip-calibration', action='store_true',
+                         help="skip the interactive pre-recording trajectory calibration prompt "
+                              "(just silently reuses calibration.json if it exists, else records "
+                              "uncalibrated trajectory values)")
     parser.add_argument('--finger', choices=config.FINGER_NAMES, default='index')
     parser.add_argument('--dataset-root', type=Path, default=Path('dataset'))
     parser.add_argument('--session-label', default='')
@@ -124,7 +137,26 @@ def main():
     if mic_device is None:
         print('[MIC] No audio interface found. Specify one with --mic-device N.')
         sys.exit(1)
+
+    device_max_ch = sd.query_devices(mic_device)['max_input_channels']
+    if args.mic_channels > device_max_ch:
+        print(f'[MIC] --mic-channels={args.mic_channels} exceeds device [{mic_device}]\'s '
+              f'max_input_channels={device_max_ch}. Pass --mic-channels {device_max_ch} '
+              f'(see --list-devices for other options).')
+        sys.exit(1)
+    if mic_target_ch_1indexed > args.mic_channels:
+        print(f'[MIC] --mic-channel={mic_target_ch_1indexed} is out of range for '
+              f'--mic-channels={args.mic_channels}.')
+        sys.exit(1)
     state.mic_target_ch = mic_target_ch_1indexed - 1
+
+    # Trajectory calibration happens before the session starts (and before
+    # the camera subprocess opens the device), so calibration time doesn't
+    # count toward the session clock and the two never fight over the
+    # camera — see collector/workers/calibration.py.
+    camera_calibration = None
+    if not args.no_camera:
+        camera_calibration = get_calibration(args.camera_index, args.skip_calibration)
 
     config.DATA_ROOT.mkdir(parents=True, exist_ok=True)
     start_session(label=args.session_label)
@@ -157,9 +189,10 @@ def main():
     state.disp_watch_gyro  = ScrollingIMU(window_sec=5.0, expected_hz=100.0)
     state.disp_finger_acc  = ScrollingIMU(window_sec=5.0, expected_hz=30.0)
     state.disp_finger_gyro = ScrollingIMU(window_sec=5.0, expected_hz=30.0)
+    state.disp_trajectory  = TrajectoryTrail(maxlen=config.TRAJ_TRAIL_MAXLEN)
 
     mic_stream = sd.InputStream(
-        device=mic_device, channels=config.MIC_CHANNELS, samplerate=args.mic_sr,
+        device=mic_device, channels=args.mic_channels, samplerate=args.mic_sr,
         blocksize=config.MIC_BLOCK_SIZE, dtype='float32', callback=mic_callback,
     )
     mic_stream.start()
@@ -181,7 +214,7 @@ def main():
         cam_proc = mp.Process(
             target=camera_process_fn,
             args=(args.camera_index, args.camera_pitch_deg, args.camera_roll_deg,
-                  state.session_start, record_queue, cam_stop_flag),
+                  state.session_start_wall, record_queue, cam_stop_flag, camera_calibration),
             daemon=True,
         )
         cam_proc.start()

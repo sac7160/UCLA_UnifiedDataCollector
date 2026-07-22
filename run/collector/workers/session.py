@@ -25,6 +25,7 @@ import scipy.io.wavfile as wavfile
 
 from ..core import config, state
 from .trial import crop_watch_audio_frames
+from trajectory_calibration import TRAJECTORY_CSV_HEADER
 
 
 def start_session(label: str = '') -> Path:
@@ -33,6 +34,7 @@ def start_session(label: str = '') -> Path:
     state.session_dir   = config.DATA_ROOT / name
     state.session_dir.mkdir(parents=True, exist_ok=True)
     state.session_start = time.perf_counter()
+    state.session_start_wall = time.time()
 
     state.watch_audio_offset = None
     state.mic_offset         = None
@@ -60,6 +62,10 @@ def start_session(label: str = '') -> Path:
         'gyro_x', 'gyro_y', 'gyro_z',
         'pos_x', 'pos_y', 'pos_z',
     ])
+
+    state.traj_fp     = open(state.session_dir / 'trajectory.csv', 'w', newline='')
+    state.traj_writer = csv.writer(state.traj_fp)
+    state.traj_writer.writerow(TRAJECTORY_CSV_HEADER)
 
     state.events_fp     = open(state.session_dir / 'events.csv', 'w', newline='')
     state.events_writer = csv.writer(state.events_fp)
@@ -97,6 +103,7 @@ def close_session():
     state.watch_wf = state.mic_wf = None
     if state.imu_fp: state.imu_fp.close(); state.imu_fp = None
     if state.cam_fp: state.cam_fp.close(); state.cam_fp = None
+    if state.traj_fp: state.traj_fp.close(); state.traj_fp = None
     if state.events_fp: state.events_fp.close(); state.events_fp = None
     if state.watch_audio_frames_fp:
         state.watch_audio_frames_fp.close()

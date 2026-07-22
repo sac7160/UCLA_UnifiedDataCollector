@@ -102,6 +102,12 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self.pw_wgyro, self.curves_wgyro = self._make_imu_plot('Watch IMU — gyro')
         self.pw_facc,  self.curves_facc  = self._make_imu_plot(f'Fingertip IMU ({state.display_finger}) — acc')
         self.pw_fgyro, self.curves_fgyro = self._make_imu_plot(f'Fingertip IMU ({state.display_finger}) — gyro')
+        self.pw_traj = self._make_traj_plot()
+        self.pw_traj.setMaximumHeight(220)   # small — lives in the right-hand column, not a full grid cell
+        self.traj_label = QtWidgets.QLabel('index tip: no data yet')
+        self.traj_label.setStyleSheet('font-size: 11px; color: #333;')
+        self.traj_label.setAlignment(QtCore.Qt.AlignCenter)
+        self.traj_label.setWordWrap(True)
 
         if use_opengl:
             for pw in (self.pw_surface_wave, self.pw_watch_wave, self.pw_wacc,
@@ -147,6 +153,8 @@ class InstructorWindow(QtWidgets.QMainWindow):
         right_layout = QtWidgets.QVBoxLayout(right_col)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.addWidget(self.cam_status_label)   # fixed height
+        right_layout.addWidget(self.pw_traj)             # fixed height (capped above), small trail plot
+        right_layout.addWidget(self.traj_label)          # fixed height
         right_layout.addWidget(self.touch_label)         # fixed height (capped above), no stretch
         right_layout.addWidget(self.log_view, 1)          # takes the rest of the vertical space
 
@@ -204,6 +212,19 @@ class InstructorWindow(QtWidgets.QMainWindow):
             curves[axis_name] = c
         return pw, curves
 
+    def _make_traj_plot(self) -> pg.PlotWidget:
+        pw = pg.PlotWidget(title='Index fingertip trajectory (mic-anchored mm once calibrated, '
+                                  'else normalized image-plane coords)')
+        pw.setLabel('bottom', 'x'); pw.setLabel('left', 'y')
+        pw.showGrid(x=True, y=True, alpha=0.25)
+        pw.setAspectLocked(True)
+        pw.invertY(True)   # image/mic-plane convention: y increases downward
+        trail = pw.plot(pen=pg.mkPen('#9467bd', width=1))
+        head = pw.plot(pen=None, symbol='o', symbolSize=8, symbolBrush='#d62728')
+        pw._trail = trail
+        pw._head = head
+        return pw
+
     # ── button handlers ──
     def _on_rec_clicked(self):
         toggle_recording()
@@ -255,6 +276,31 @@ class InstructorWindow(QtWidgets.QMainWindow):
         pad = max((hi - lo) * 0.15, 1e-3)
         pw.setYRange(lo - pad, hi + pad, padding=0)
 
+    def _update_trajectory(self):
+        x, y = state.disp_trajectory.get_xy()
+        self.pw_traj._trail.setData(x, y)
+        self.pw_traj._head.setData(x[-1:], y[-1:])
+
+        traj = state.disp_trajectory.latest
+        if not traj:
+            self.traj_label.setText('index tip: no data yet')
+            return
+        calib_tag = '[calibrated]' if traj.get('calibrated') else '[uncalibrated]'
+        if not traj['index_record'].detected:
+            self.traj_label.setText(f'index tip: not detected  {calib_tag}')
+        elif traj.get('global_xy') is not None:
+            gx, gy = traj['global_xy']
+            height = traj.get('height_mm')
+            txt = f'index tip: x={gx:.1f}mm  y={gy:.1f}mm'
+            if height is not None:
+                txt += f'  h={height:.1f}mm'
+            self.traj_label.setText(f'{txt}  {calib_tag}')
+        elif traj.get('x_norm') is not None:
+            self.traj_label.setText(
+                f'index tip: x_norm={traj["x_norm"]:.3f}  y_norm={traj["y_norm"]:.3f}  {calib_tag}')
+        else:
+            self.traj_label.setText(f'index tip: no position  {calib_tag}')
+
     def _set_touch_visual(self, is_on: bool, metric_db: float):
         if state.is_calibrating:
             self.touch_label.setStyleSheet('background-color: #f1c40f; color: black;')
@@ -288,6 +334,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self._update_imu(self.pw_wgyro, self.curves_wgyro, state.disp_watch_gyro)
         self._update_imu(self.pw_facc, self.curves_facc, state.disp_finger_acc)
         self._update_imu(self.pw_fgyro, self.curves_fgyro, state.disp_finger_gyro)
+        self._update_trajectory()
         self._set_touch_visual(state.touch_on_state, state.touch_metric_db)
         self._update_log_panel()
 

@@ -28,6 +28,8 @@ touch_detection.py splits the mic path:
   watch_imu_worker_fn()    Parses and writes watch IMU packets.
 """
 
+from __future__ import annotations
+
 import queue
 import socket
 import time

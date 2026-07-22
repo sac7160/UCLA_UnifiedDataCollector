@@ -19,6 +19,8 @@ Grouped by the subsystem that owns each block below, matching the module
 that primarily writes to it (though many are read from several places).
 """
 
+from __future__ import annotations
+
 import queue
 import threading
 from collections import deque
@@ -36,6 +38,9 @@ rolling_lock  = threading.Lock()   # guards _imu_rolling / _watch_audio_rolling
 # ─── Session / file state (session.py owns writes) ───────────────────────────
 session_dir = None                  # Path | None
 session_start: float | None = None
+session_start_wall: float | None = None   # time.time() at session start — see camera.py's docstring for why
+                                            # this (not session_start) is what crosses the process boundary
+                                            # into the camera subprocess
 
 watch_wf = None                     # wave.Wave_write | None — owned by watch_network.py's audio worker
 mic_wf   = None                     # wave.Wave_write | None — owned by touch_detection.py's mic wav writer
@@ -46,6 +51,10 @@ imu_flush_n = 0
 cam_fp = None
 cam_writer = None
 cam_flush_n = 0
+
+traj_fp = None
+traj_writer = None
+traj_flush_n = 0
 
 events_fp = None
 events_writer = None
@@ -93,6 +102,7 @@ trial_buffers = {
     # latency, so they're handled separately via the rolling buffers below
     # instead of being gated directly by REC state.
     'fingertip': [],
+    'trajectory': [],
     'mic':       [],
 }
 trial_queue: "queue.Queue" = queue.Queue()   # carries (start, end, snapshot, trigger, label)
@@ -130,6 +140,7 @@ disp_watch_acc  = None
 disp_watch_gyro = None
 disp_finger_acc  = None
 disp_finger_gyro = None
+disp_trajectory  = None   # TrajectoryTrail — index-fingertip 2D trail, see gui/display_buffers.py
 display_finger = 'index'   # which finger's fingertip IMU is shown; set from --finger / GUI
 
 # ─── Touch detection (touch_detection.py owns) ───────────────────────────────

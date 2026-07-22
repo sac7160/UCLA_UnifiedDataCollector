@@ -7,6 +7,8 @@ the source of truth; instances of these classes are just a live view of the
 same data, held in state.py.
 """
 
+from __future__ import annotations
+
 import threading
 import time
 from collections import deque
@@ -118,3 +120,32 @@ class ScrollingIMU:
             return 0.0
         span = self.t[-1] - self.t[0]
         return (len(self.t) - 1) / span if span > 0 else 0.0
+
+
+class TrajectoryTrail:
+    """Ring buffer of recent index-fingertip 2D positions, for a live trail
+    plot, plus the latest frame's full compute_trajectory() dict for the
+    numeric readout. Plots mic-anchored mm coordinates once calibrated;
+    falls back to normalized image-plane coordinates (0-1) beforehand, so
+    the trail shows *something* even before/without calibration."""
+
+    def __init__(self, maxlen: int = 150):
+        self.xs = deque(maxlen=maxlen)
+        self.ys = deque(maxlen=maxlen)
+        self.latest: dict = {}
+
+    def push(self, traj: dict):
+        self.latest = traj
+        x = y = None
+        if traj.get('global_xy') is not None:
+            x, y = traj['global_xy']
+        elif traj.get('x_norm') is not None:
+            x, y = traj['x_norm'], traj['y_norm']
+        if x is not None:
+            self.xs.append(x)
+            self.ys.append(y)
+
+    def get_xy(self):
+        if not self.xs:
+            return np.array([0.0]), np.array([0.0])
+        return np.asarray(self.xs), np.asarray(self.ys)

@@ -41,6 +41,8 @@ fingertip_imu_multi.py (from the WristPad repo) importable on PYTHONPATH.
     pip install pyqtgraph PyQt5
 """
 
+from __future__ import annotations
+
 import argparse
 import multiprocessing as mp
 import queue

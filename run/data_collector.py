@@ -46,6 +46,8 @@ Usage:
     python experiment_collector.py --dataset-root dataset/ --list-devices
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import json

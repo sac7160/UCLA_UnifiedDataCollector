@@ -14,10 +14,13 @@ hard to notice until you overlay two supposedly-aligned files and the
 peaks don't match.
 """
 
+from __future__ import annotations
+
 import numpy as np
 
 from ..core import config, state
 from ..core.utils import offset, rolling_cutoff
+from trajectory_calibration import trajectory_csv_row
 
 
 def write_watch_audio(raw_bytes: bytes, watch_ts_ms: float | None = None,
@@ -119,3 +122,24 @@ def write_fingertip_imu(records: list):
             state.disp_finger_acc.push(*acc_vals)
         if all(np.isfinite(v) for v in gyro_vals):
             state.disp_finger_gyro.push(*gyro_vals)
+
+
+def write_trajectory(traj: dict):
+    """traj: dict returned by trajectory_calibration.compute_trajectory() for
+    one frame (same frame whose records were just passed to
+    write_fingertip_imu() — see camera.py). Uses the index record's own
+    timestamp, same as write_fingertip_imu does for its rows."""
+    ts = traj['index_record'].timestamp
+    with state.file_lock:
+        if state.traj_writer:
+            state.traj_writer.writerow(trajectory_csv_row(ts, traj))
+            state.traj_flush_n += 1
+            if state.traj_flush_n % config.CAM_FLUSH_EVERY_N == 0 and state.traj_fp:
+                state.traj_fp.flush()
+
+    with state.trial_lock:
+        if state.trial_active:
+            state.trial_buffers['trajectory'].append(traj)
+
+    if state.disp_trajectory is not None:
+        state.disp_trajectory.push(traj)
