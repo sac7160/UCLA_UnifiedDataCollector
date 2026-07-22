@@ -23,7 +23,7 @@ import queue
 import time
 
 
-def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue"):
+def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue", mirror: bool = False):
     import cv2 as _cv2
     from fingertip_imu_multi import MultiFingertipIMUTracker
     from trajectory_calibration import load_calibration, run_calibration
@@ -50,7 +50,8 @@ def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue"):
             ok, frame = cap.read()
             if not ok:
                 continue
-            frame = _cv2.flip(frame, 1)
+            if mirror:
+                frame = _cv2.flip(frame, 1)
             tracker.update(frame, timestamp=time.perf_counter())
             # Draw the live-preview overlay on a copy, not `frame` itself —
             # `frame` (unannotated) is what gets passed into calibration
@@ -78,19 +79,21 @@ def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue"):
     result_queue.put(calibration)
 
 
-def get_calibration(camera_index: int, skip: bool) -> dict | None:
+def get_calibration(camera_index: int, skip: bool, mirror: bool = False) -> dict | None:
     """Called from run.py's main(), before the session starts and before
     camera.py's real capture process opens the device — so calibration time
     doesn't count toward the session clock and the two never fight over the
     camera. `skip` (--skip-calibration) silently reuses run/calibration.json
-    if present instead of showing the interactive prompt."""
+    if present instead of showing the interactive prompt. `mirror` must match
+    whatever's passed to camera.py's camera_process_fn — the calibrated
+    mic-anchored origin is only valid in the orientation it was measured in."""
     from trajectory_calibration import load_calibration
 
     if skip:
         return load_calibration()
 
     result_queue: "mp.Queue" = mp.Queue()
-    proc = mp.Process(target=_run_precalibration_process, args=(camera_index, result_queue))
+    proc = mp.Process(target=_run_precalibration_process, args=(camera_index, result_queue, mirror))
     proc.start()
     proc.join()
     try:

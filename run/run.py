@@ -82,6 +82,11 @@ def main():
     parser.add_argument('--camera-pitch-deg', type=float, default=None)
     parser.add_argument('--camera-roll-deg', type=float, default=0.0)
     parser.add_argument('--no-camera', action='store_true')
+    parser.add_argument('--mirror', action='store_true',
+                         help='mirror the camera feed horizontally before MediaPipe processes it. '
+                              'Off by default so hand_label and every x-coordinate '
+                              '(x_px, local_x_mm, global_x_mm, ...) match true physical left/right; '
+                              'pass this if you specifically want a selfie-style mirrored view instead.')
     parser.add_argument('--skip-calibration', action='store_true',
                          help="skip the interactive pre-recording trajectory calibration prompt "
                               "(just silently reuses calibration.json if it exists, else records "
@@ -160,7 +165,7 @@ def main():
     # camera — see collector/workers/calibration.py.
     camera_calibration = None
     if not args.no_camera:
-        camera_calibration = get_calibration(args.camera_index, args.skip_calibration)
+        camera_calibration = get_calibration(args.camera_index, args.skip_calibration, args.mirror)
 
     config.DATA_ROOT.mkdir(parents=True, exist_ok=True)
     start_session(label=args.session_label)
@@ -218,7 +223,7 @@ def main():
         cam_proc = mp.Process(
             target=camera_process_fn,
             args=(args.camera_index, args.camera_pitch_deg, args.camera_roll_deg,
-                  state.session_start_wall, record_queue, cam_stop_flag, camera_calibration),
+                  state.session_start_wall, record_queue, cam_stop_flag, camera_calibration, args.mirror),
             daemon=True,
         )
         cam_proc.start()

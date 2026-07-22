@@ -33,6 +33,14 @@ costs no extra inference — just a bit of extra arithmetic per frame. The
 `calibration` dict is loaded once in run.py's main() (see
 collector/workers/calibration.py) and passed in here unchanged for the
 lifetime of the process; recalibrating requires restarting collection.
+
+`mirror` (--mirror) is off by default: MediaPipe's handedness classification
+and every x-coordinate (x_px, local_x_mm, global_x_mm, ...) are computed
+directly off whatever frame is passed to the tracker, so mirroring it here
+would mirror all of that too, relative to true physical left/right. Must be
+passed the same way to calibration.py's precalibration step (see run.py's
+main()) — the calibrated mic-anchored origin is only valid in whichever
+orientation it was measured in.
 """
 
 from __future__ import annotations
@@ -48,7 +56,7 @@ from .writers import write_fingertip_imu, write_trajectory
 def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: float,
                        session_start_wall: float,
                        record_queue: "mp.Queue", stop_flag: "mp.Event",
-                       calibration: dict | None = None):
+                       calibration: dict | None = None, mirror: bool = False):
     import cv2 as _cv2
     from fingertip_imu_multi import MultiFingertipIMUTracker, gravity_vector_from_camera_tilt
     from trajectory_calibration import compute_trajectory
@@ -71,7 +79,8 @@ def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: floa
         success, frame = cap.read()
         if not success:
             continue
-        frame = _cv2.flip(frame, 1)
+        if mirror:
+            frame = _cv2.flip(frame, 1)
         h, w = frame.shape[:2]
         ts = time.time() - session_start_wall
         records = tracker.update(frame, timestamp=ts)
