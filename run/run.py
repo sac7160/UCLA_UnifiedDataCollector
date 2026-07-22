@@ -28,9 +28,9 @@ every thread/process in the right order, building the two windows, and
 tearing everything down cleanly on exit.
 
 Usage:
-    python collector.py
-    python collector.py --mic-device 1 --mic-channel 1
-    python collector.py --dataset-root dataset/ --list-devices
+    python run.py
+    python run.py --mic-device 1 --mic-channel 1
+    python run.py --dataset-root dataset/ --list-devices
 """
 
 import argparse
@@ -47,14 +47,17 @@ from pyqtgraph.Qt import QtCore, QtGui
 from pynput import keyboard
 
 from collector.core import config, state
+from collector.core.utils import install_stdout_tee
 from collector.gui.display_buffers import ScrollingWaveform, ScrollingSpectrogram, ScrollingIMU
 from collector.workers.session import start_session, close_session
 from collector.workers.touch_detection import (
     mic_callback, mic_wav_writer_fn, audio_worker_fn, rebuild_touch_band_filter,
 )
-from collector.workers.watch_network import net_thread_fn, watch_audio_worker_fn, watch_imu_worker_fn
+from collector.workers.watch_network import (
+    net_thread_fn, watch_audio_worker_fn, watch_imu_worker_fn, heartbeat_thread_fn,
+)
 from collector.workers.camera import camera_process_fn, camera_bridge_thread_fn
-from collector.workers.trial import trial_worker_fn, on_key_press, on_key_release
+from collector.workers.trial import trial_worker_fn, on_key_press, on_key_release, write_event
 from collector.gui.instructor_window import InstructorWindow
 from collector.gui.experimenter_window import ExperimenterWindow
 
@@ -93,6 +96,8 @@ def main():
             if d['max_input_channels'] > 0:
                 print(f'  [{i:2d}] {d["name"]} (in={d["max_input_channels"]}, sr={int(d["default_samplerate"])})')
         return
+
+    install_stdout_tee()   # from here on, every print()/log() also reaches the instructor window's log panel
 
     app = pg.mkQApp('WristPad Experiment Collector')
 
@@ -135,6 +140,7 @@ def main():
     state.current_material = args.material
     band_low, band_high = config.MATERIAL_PRESETS[args.material]
     rebuild_touch_band_filter(args.mic_sr, band_low, band_high)
+    write_event(f'material:{args.material}')
 
     surface_decimate = max(1, args.mic_sr // args.display_hz)
     state.disp_surface_wave = ScrollingWaveform(args.mic_sr, args.window_sec, decimate=surface_decimate)
@@ -165,6 +171,8 @@ def main():
     watch_audio_worker_t.start()
     watch_imu_worker_t = threading.Thread(target=watch_imu_worker_fn, daemon=True)
     watch_imu_worker_t.start()
+    heartbeat_t = threading.Thread(target=heartbeat_thread_fn, daemon=True)
+    heartbeat_t.start()
 
     cam_proc = cam_bridge_t = record_queue = cam_stop_flag = None
     if not args.no_camera:
@@ -197,8 +205,10 @@ def main():
 
     instructor = InstructorWindow(args.window_sec, has_camera=not args.no_camera,
                                    use_opengl=args.opengl)
-    instructor.label_edit.setText(args.session_label)
-    state.label_getter = lambda: instructor.label_edit.text()
+    # Label input was removed from the instructor window — the label for
+    # every trial this session is now fixed to whatever --session-label
+    # was passed at startup (empty -> saved under dataset/unlabeled/).
+    state.label_getter = lambda: args.session_label
 
     experimenter = ExperimenterWindow()
 
@@ -241,6 +251,7 @@ def main():
         net_t.join(timeout=2.0)   # stops before its consumers, so no new items get queued after this
         watch_audio_worker_t.join(timeout=2.0)
         watch_imu_worker_t.join(timeout=2.0)
+        heartbeat_t.join(timeout=2.0)
         if cam_proc:
             cam_proc.join(timeout=2.0)
             if cam_proc.is_alive():

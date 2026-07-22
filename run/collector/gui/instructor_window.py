@@ -1,9 +1,9 @@
 """
-wristpad/gui/instructor_window.py
+data_collector/gui/instructor_window.py
 ────────────────────────────────────────────────────────────────────────────
 Live waveforms/spectrograms/IMU plots (same as realtime_multimodal_viz.py's
 dashboard) plus REC controls, material presets, and the label field. Reads
-everything it displays from wristpad.core.state — never computes anything
+everything it displays from data_collector.core.state — never computes anything
 itself beyond formatting. Its update() is called from data_collector.py's
 QTimer tick; it doesn't schedule its own redraws.
 """
@@ -48,6 +48,12 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self.status_label = QtWidgets.QLabel('')
         self.status_label.setStyleSheet('font-size: 12px; color: #333;')
         rec_row.addWidget(self.status_label)
+        rec_row.addSpacing(20)
+        self.quit_btn = QtWidgets.QPushButton('■ QUIT')
+        self.quit_btn.setStyleSheet('font-size: 13px; font-weight: bold; padding: 6px 12px; '
+                                     'background-color: #444; color: white;')
+        self.quit_btn.clicked.connect(self._on_quit_clicked)
+        rec_row.addWidget(self.quit_btn)
         outer.addLayout(rec_row)
 
         meta_row = QtWidgets.QHBoxLayout()
@@ -61,12 +67,6 @@ class InstructorWindow(QtWidgets.QMainWindow):
             btn.clicked.connect(lambda checked=False, n=name: self._on_material_clicked(n))
             meta_row.addWidget(btn)
         meta_row.addWidget(self.material_label)
-        meta_row.addSpacing(20)
-        meta_row.addWidget(QtWidgets.QLabel('label / stimulus:'))
-        self.label_edit = QtWidgets.QLineEdit()
-        self.label_edit.setPlaceholderText('e.g. A, 5, line_horizontal ...')
-        self.label_edit.setMaximumWidth(200)
-        meta_row.addWidget(self.label_edit)
         meta_row.addStretch(1)
         outer.addLayout(meta_row)
 
@@ -127,15 +127,28 @@ class InstructorWindow(QtWidgets.QMainWindow):
 
         self.touch_label = QtWidgets.QLabel()
         self.touch_label.setAlignment(QtCore.Qt.AlignCenter)
-        font = self.touch_label.font(); font.setPointSize(24); font.setBold(True)
+        font = self.touch_label.font(); font.setPointSize(16); font.setBold(True)
         self.touch_label.setFont(font)
+        self.touch_label.setMaximumHeight(70)   # was stretch=1 (filled all remaining space) — now capped short
         self._set_touch_visual(False, -60.0)
+
+        # Terminal-style log panel — mirrors everything printed to stdout
+        # (see utils.install_stdout_tee / state.log_lines). Only appends
+        # new lines each tick (see update()) rather than resetting the
+        # whole widget, so scroll position/selection isn't fought over.
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(500)   # matches state.log_lines' maxlen — old lines just scroll off
+        self.log_view.setStyleSheet('background-color: #111; color: #ddd; font-family: Menlo, Consolas, monospace; '
+                                     'font-size: 11px;')
+        self._log_last_seq = 0
 
         right_col = QtWidgets.QWidget()
         right_layout = QtWidgets.QVBoxLayout(right_col)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.addWidget(self.cam_status_label)
-        right_layout.addWidget(self.touch_label, 1)
+        right_layout.addWidget(self.cam_status_label)   # fixed height
+        right_layout.addWidget(self.touch_label)         # fixed height (capped above), no stretch
+        right_layout.addWidget(self.log_view, 1)          # takes the rest of the vertical space
 
         minmax_row = QtWidgets.QHBoxLayout()
         self.minmax_label = QtWidgets.QLabel('since reset — min=–  max=–')
@@ -195,6 +208,19 @@ class InstructorWindow(QtWidgets.QMainWindow):
     def _on_rec_clicked(self):
         toggle_recording()
 
+    def _on_quit_clicked(self):
+        if state.rec_active:
+            reply = QtWidgets.QMessageBox.question(
+                self, 'Quit while recording?',
+                'A recording is currently in progress. Stop it and quit?',
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No,
+            )
+            if reply != QtWidgets.QMessageBox.Yes:
+                return
+            toggle_recording()   # cleanly stop (and save) the in-progress trial before quitting
+        QtWidgets.QApplication.instance().quit()   # triggers aboutToQuit -> the same clean shutdown as Ctrl+C
+
     def _on_material_clicked(self, name: str):
         set_material(name)
         low, high = config.MATERIAL_PRESETS[name]
@@ -240,6 +266,19 @@ class InstructorWindow(QtWidgets.QMainWindow):
             self.touch_label.setStyleSheet('background-color: #d62728; color: white;')
             self.touch_label.setText(f'TOUCH OFF\n({metric_db:.1f} dB above floor)')
 
+    def _update_log_panel(self):
+        with state.log_lock:
+            new_seq = state.log_seq
+            if new_seq == self._log_last_seq:
+                return
+            n_new = min(new_seq - self._log_last_seq, len(state.log_lines))
+            new_lines = list(state.log_lines)[-n_new:] if n_new > 0 else []
+            self._log_last_seq = new_seq
+        if new_lines:
+            self.log_view.appendPlainText('\n'.join(new_lines))
+            sb = self.log_view.verticalScrollBar()
+            sb.setValue(sb.maximum())   # auto-scroll to the newest line
+
     def update(self):
         self._update_waveform(self.pw_surface_wave, state.disp_surface_wave)
         self._update_waveform(self.pw_watch_wave, state.disp_watch_wave)
@@ -250,6 +289,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self._update_imu(self.pw_facc, self.curves_facc, state.disp_finger_acc)
         self._update_imu(self.pw_fgyro, self.curves_fgyro, state.disp_finger_gyro)
         self._set_touch_visual(state.touch_on_state, state.touch_metric_db)
+        self._update_log_panel()
 
         if np.isfinite(state.touch_metric_db) and not state.is_calibrating:
             self._metric_min = state.touch_metric_db if self._metric_min is None \

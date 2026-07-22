@@ -18,7 +18,7 @@ WATCH_BUF_SIZE   = WATCH_FRAME_SIZE * 2   # 3840 bytes
 # watch_ts_ms is systematically late relative to true capture time.
 # Corrected once, at trial-crop time, after the RTBGN-based watch-clock ->
 # PC-time mapping is known.
-WATCH_AUDIO_LATENCY_SEC = 0.07#0.045
+WATCH_AUDIO_LATENCY_SEC = 0.04#0.07#0.045
 
 # ─── Surface mic ──────────────────────────────────────────────────────────────
 MIC_SR         = 192000

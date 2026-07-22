@@ -69,6 +69,10 @@ def start_session(label: str = '') -> Path:
     state.watch_audio_frames_writer = csv.writer(state.watch_audio_frames_fp)
     state.watch_audio_frames_writer.writerow(['sample_offset', 'num_samples', 'watch_ts_ms'])
     state.watch_audio_session_samples = 0
+    with state.heartbeat_lock:
+        state.heartbeat_audio_frames = 0
+        state.heartbeat_imu_acc = 0
+        state.heartbeat_imu_gyro = 0
 
     state.sync = {
         'session_start_epoch':      time.time(),

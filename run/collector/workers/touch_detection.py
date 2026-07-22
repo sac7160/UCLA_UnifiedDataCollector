@@ -38,7 +38,7 @@ import numpy as np
 from scipy.signal import butter, sosfilt, sosfilt_zi
 
 from ..core import config, state
-from .trial import write_event_at
+from .trial import write_event, write_event_at
 from ..core.utils import log, offset
 
 
@@ -161,6 +161,7 @@ def audio_worker_fn():
             name, band_low, band_high = state.material_change_queue.get_nowait()
             rebuild_touch_band_filter(state.mic_sr_runtime, band_low, band_high)
             state.current_material = name
+            write_event(f'material:{name}')
         except queue.Empty:
             pass
         except Exception as e:

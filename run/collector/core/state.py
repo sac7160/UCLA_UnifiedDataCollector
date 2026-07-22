@@ -54,9 +54,25 @@ event_log: list = []   # (ts, event) for the whole session — see trial.write_e
                         # alongside imu.csv/fingertip_imu.csv, on the same time_aligned convention
 space_down = False   # guards OS key-repeat while spacebar is physically held
 
+# ─── Instructor window's live terminal/log panel (utils.install_stdout_tee) ──
+log_lock = threading.Lock()
+log_lines = deque(maxlen=500)   # rolling buffer of recent stdout lines
+log_seq = 0                     # monotonically increasing — GUI compares against its own
+                                 # last-seen value to know how many new lines arrived since the last tick
+
 watch_audio_frames_fp = None
 watch_audio_frames_writer = None
 watch_audio_session_samples = 0
+
+# ─── Periodic "still receiving watch data" heartbeat (watch_network.py) ──────
+# Incremented on every real packet, printed+reset every HEARTBEAT_INTERVAL_SEC
+# by heartbeat_thread_fn() — this is the one thing that prints during normal
+# operation, so it stays a single line every few seconds rather than a line
+# per packet (which is what --verbose is for, off by default).
+heartbeat_lock = threading.Lock()
+heartbeat_audio_frames = 0
+heartbeat_imu_acc = 0
+heartbeat_imu_gyro = 0
 
 watch_audio_offset: float | None = None
 mic_offset:         float | None = None

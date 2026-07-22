@@ -1,5 +1,5 @@
 """
-wristpad/workers/watch_network.py
+data_collector/workers/watch_network.py
 ────────────────────────────────────────────────────────────────────────────
 Watch TCP connection, split by latency-sensitivity the same way
 touch_detection.py splits the mic path:
@@ -35,6 +35,7 @@ import time
 import numpy as np
 
 from ..core import config, state
+from ..core.utils import log
 from .writers import write_imu, write_watch_audio
 
 
@@ -104,7 +105,7 @@ def dispatch_watch_packet(pkt: bytes, arrival_pc: float):
         return
 
     if hdr == 'SUBID':
-        pass
+        log('NET', f'SUBID  {pkt[6:10].decode("utf-8", errors="ignore").strip()}')
     elif hdr == 'RTBGN':
         pc_sec = arrival_pc - state.session_start
         if len(pkt) >= 13:
@@ -112,6 +113,7 @@ def dispatch_watch_packet(pkt: bytes, arrival_pc: float):
             with state.file_lock:
                 state.sync['rtbgn_watch_ms'] = watch_ms
                 state.sync['rtbgn_pc_sec'] = pc_sec
+            log('NET', f'RTBGN  watch_ms={watch_ms}  pc_sec={pc_sec:.4f}s')
     elif hdr == 'RTEND':
         pc_sec = arrival_pc - state.session_start
         if len(pkt) >= 13:
@@ -119,6 +121,7 @@ def dispatch_watch_packet(pkt: bytes, arrival_pc: float):
             with state.file_lock:
                 state.sync['rtend_watch_ms'] = watch_ms
                 state.sync['rtend_pc_sec'] = pc_sec
+            log('NET', f'RTEND  watch_ms={watch_ms}  pc_sec={pc_sec:.4f}s')
         state.watch_audio_queue.put(('__RTEND__', arrival_pc))
     elif hdr == 'SOUND':
         raw = pkt[10:]
@@ -154,6 +157,8 @@ def watch_audio_worker_fn():
                 write_watch_audio(pkt[8:], watch_ts_ms, arrival_offset=arrival_offset)
             else:
                 write_watch_audio(pkt, arrival_offset=arrival_offset)
+            with state.heartbeat_lock:
+                state.heartbeat_audio_frames += 1
         except Exception:
             pass   # a dead thread here would silently stop writing watch_audio.wav for the rest of the session
 
@@ -165,9 +170,33 @@ def watch_imu_worker_fn():
         except queue.Empty:
             continue
         try:
-            parse_imu_packet(pkt, sensor, arrival_pc, state.session_start)
+            n = parse_imu_packet(pkt, sensor, arrival_pc, state.session_start)
+            with state.heartbeat_lock:
+                if sensor == 'acc':
+                    state.heartbeat_imu_acc += n
+                else:
+                    state.heartbeat_imu_gyro += n
         except Exception:
             pass
+
+
+def heartbeat_thread_fn(interval_sec: float = 3.0):
+    """The one thing that prints during normal, healthy operation — a
+    single summary line every `interval_sec` seconds confirming watch data
+    is still arriving, instead of either a line per packet (too much —
+    what --verbose is for) or nothing at all (too little — you can't tell
+    a stalled connection from a quiet one)."""
+    while not state.stop_event.wait(interval_sec):
+        with state.heartbeat_lock:
+            frames, acc, gyro = state.heartbeat_audio_frames, state.heartbeat_imu_acc, state.heartbeat_imu_gyro
+            state.heartbeat_audio_frames = 0
+            state.heartbeat_imu_acc = 0
+            state.heartbeat_imu_gyro = 0
+        if frames == 0 and acc == 0 and gyro == 0:
+            log('NET', f'no watch data in the last {interval_sec:.0f}s — check the watch app is still streaming')
+        else:
+            log('NET', f'receiving OK — watch_audio: {frames} frames, IMU: acc={acc} gyro={gyro} '
+                        f'(last {interval_sec:.0f}s)')
 
 
 def net_thread_fn(watch_port: int):
@@ -177,14 +206,26 @@ def net_thread_fn(watch_port: int):
     srv.listen(16)
     srv.settimeout(1.0)
 
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = 'unknown'
+    print(f'[NET] Watch TCP: {local_ip}:{watch_port}')
+
     while not state.stop_event.is_set():
         try:
             conn, addr = srv.accept()
         except socket.timeout:
             continue
-        except Exception:
+        except Exception as e:
+            if not state.stop_event.is_set():
+                log('NET', f'accept error: {e}')
             continue
 
+        log('NET', f'watch connected from {addr}')
         conn.settimeout(1.0)
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         try:
@@ -194,6 +235,7 @@ def net_thread_fn(watch_port: int):
                     break
                 msg_len = int.from_bytes(header, byteorder='big', signed=False)
                 if msg_len <= 0 or msg_len > 10_000_000:
+                    log('NET', f'implausible message length {msg_len}, dropping connection')
                     break
                 payload = recv_exact(conn, msg_len)
                 if payload is None:
@@ -205,8 +247,11 @@ def net_thread_fn(watch_port: int):
                 # thread gets to processing it.
                 arrival_pc = time.perf_counter()
                 dispatch_watch_packet(payload, arrival_pc)
-        except Exception:
-            pass
+        except Exception as e:
+            log('NET', f'connection error: {e}')
         finally:
             conn.close()
+            log('NET', 'watch disconnected — waiting for reconnect')
+
     srv.close()
+    log('NET', 'stopped')
