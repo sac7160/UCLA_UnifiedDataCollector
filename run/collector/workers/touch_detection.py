@@ -42,10 +42,15 @@ from .trial import write_event, write_event_at
 from ..core.utils import log, offset
 
 
-def rebuild_touch_band_filter(mic_sr: int, band_low: float, band_high: float):
+def rebuild_touch_band_filter(mic_sr: int, band_low: float, band_high: float,
+                               on_threshold_db: float, off_threshold_db: float):
     """(Re)builds the band-pass filter and starts a fresh floor
     calibration window — called at startup and on every material-preset
-    switch.
+    switch. `on_threshold_db`/`off_threshold_db` come from
+    config.MATERIAL_THRESHOLDS for whichever material is being switched
+    to (see set_material()) — different surfaces pick up contact at
+    different loudness relative to their own ambient noise, so the
+    threshold needs to follow the material the same way the band does.
 
     IMPORTANT: only ever call this from audio_worker_fn's own thread (see
     where it's invoked below). It resets state that thread reads/writes
@@ -73,8 +78,8 @@ def rebuild_touch_band_filter(mic_sr: int, band_low: float, band_high: float):
     state.touch_on_state = False
     state.touch_candidate_on_time = 0.0
     state.touch_candidate_off_time = 0.0
-    state.touch_on_threshold_db = config.TOUCH_ON_THRESHOLD_DB
-    state.touch_off_threshold_db = config.TOUCH_OFF_THRESHOLD_DB
+    state.touch_on_threshold_db = on_threshold_db
+    state.touch_off_threshold_db = off_threshold_db
 
     state.is_calibrating = True
     state.calibration_start_time = None   # set on the first block audio_worker_fn sees after this
@@ -82,7 +87,8 @@ def rebuild_touch_band_filter(mic_sr: int, band_low: float, band_high: float):
 
     if state.touch_median_buf is not None:
         state.touch_median_buf.clear()
-    print(f'[TOUCH] band-pass set to {band_low:.0f}-{band_high:.0f}Hz — '
+    print(f'[TOUCH] band-pass set to {band_low:.0f}-{band_high:.0f}Hz, '
+          f'thresholds on={on_threshold_db:.1f}dB/off={off_threshold_db:.1f}dB — '
           f'calibrating floor for {config.CALIBRATION_DURATION_SEC}s (keep the surface quiet)...')
 
 
@@ -94,11 +100,13 @@ def set_material(name: str):
     if name not in config.MATERIAL_PRESETS:
         return
     band_low, band_high = config.MATERIAL_PRESETS[name]
+    on_db, off_db = config.MATERIAL_THRESHOLDS.get(
+        name, (config.TOUCH_ON_THRESHOLD_DB, config.TOUCH_OFF_THRESHOLD_DB))
     try:
         state.material_change_queue.get_nowait()
     except queue.Empty:
         pass
-    state.material_change_queue.put_nowait((name, band_low, band_high))
+    state.material_change_queue.put_nowait((name, band_low, band_high, on_db, off_db))
 
 
 _mic_sos = butter(2, 10.0 / (config.MIC_SR / 2), btype='high', output='sos')
@@ -158,8 +166,8 @@ def audio_worker_fn():
         # thread that owns all the state it resets. See set_material()'s
         # docstring.
         try:
-            name, band_low, band_high = state.material_change_queue.get_nowait()
-            rebuild_touch_band_filter(state.mic_sr_runtime, band_low, band_high)
+            name, band_low, band_high, on_db, off_db = state.material_change_queue.get_nowait()
+            rebuild_touch_band_filter(state.mic_sr_runtime, band_low, band_high, on_db, off_db)
             state.current_material = name
             write_event(f'material:{name}')
         except queue.Empty:

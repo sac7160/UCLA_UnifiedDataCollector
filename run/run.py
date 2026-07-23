@@ -180,7 +180,9 @@ def main():
     state.touch_min_off_sec = args.touch_min_off_ms / 1000.0
     state.current_material = args.material
     band_low, band_high = config.MATERIAL_PRESETS[args.material]
-    rebuild_touch_band_filter(args.mic_sr, band_low, band_high)
+    on_db, off_db = config.MATERIAL_THRESHOLDS.get(
+        args.material, (config.TOUCH_ON_THRESHOLD_DB, config.TOUCH_OFF_THRESHOLD_DB))
+    rebuild_touch_band_filter(args.mic_sr, band_low, band_high, on_db, off_db)
     write_event(f'material:{args.material}')
 
     surface_decimate = max(1, args.mic_sr // args.display_hz)

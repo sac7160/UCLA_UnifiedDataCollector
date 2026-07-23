@@ -1,0 +1,92 @@
+[
+  {
+    "name": "fingertipimu_only",
+    "modality": "imu",
+    "audio_source": "surface",
+    "imu_source": "fingertip",
+    "test_acc": 0.978021978021978,
+    "test_loss": 0.04315669134330864,
+    "val_acc_best": 0.989010989010989,
+    "n_test": 91,
+    "classes": [
+      "digits_0",
+      "digits_1",
+      "digits_2"
+    ]
+  },
+  {
+    "name": "surface_only",
+    "modality": "audio",
+    "audio_source": "surface",
+    "imu_source": "fingertip",
+    "test_acc": 0.967032967032967,
+    "test_loss": 0.11678017332003666,
+    "val_acc_best": 0.945054945054945,
+    "n_test": 91,
+    "classes": [
+      "digits_0",
+      "digits_1",
+      "digits_2"
+    ]
+  },
+  {
+    "name": "surfacemic+fingertipimu",
+    "modality": "fusion",
+    "audio_source": "surface",
+    "imu_source": "fingertip",
+    "test_acc": 0.978021978021978,
+    "test_loss": 0.027336613965607093,
+    "val_acc_best": 0.989010989010989,
+    "n_test": 91,
+    "classes": [
+      "digits_0",
+      "digits_1",
+      "digits_2"
+    ]
+  },
+  {
+    "name": "watchimu_only",
+    "modality": "imu",
+    "audio_source": "surface",
+    "imu_source": "watch",
+    "test_acc": 1.0,
+    "test_loss": 0.18262240241517078,
+    "val_acc_best": 1.0,
+    "n_test": 91,
+    "classes": [
+      "digits_0",
+      "digits_1",
+      "digits_2"
+    ]
+  },
+  {
+    "name": "watchmic+watchimu",
+    "modality": "fusion",
+    "audio_source": "watch",
+    "imu_source": "watch",
+    "test_acc": 1.0,
+    "test_loss": 0.01479545218747232,
+    "val_acc_best": 1.0,
+    "n_test": 91,
+    "classes": [
+      "digits_0",
+      "digits_1",
+      "digits_2"
+    ]
+  },
+  {
+    "name": "watchmic_only",
+    "modality": "audio",
+    "audio_source": "watch",
+    "imu_source": "fingertip",
+    "test_acc": 0.7472527472527473,
+    "test_loss": 0.6301166300590222,
+    "val_acc_best": 0.7472527472527473,
+    "n_test": 91,
+    "classes": [
+      "digits_0",
+      "digits_1",
+      "digits_2"
+    ]
+  }
+]

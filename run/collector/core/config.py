@@ -62,7 +62,6 @@ MATERIAL_PRESETS = {
 ENV_ATTACK_TAU_SEC  = 0.005
 ENV_RELEASE_TAU_SEC = 0.08
 CALIBRATION_DURATION_SEC = 1.5   # how long to listen quietly before fixing the floor
-
 # The ONLY place the touch on/off decision thresholds are set — the
 # instructor window's threshold/hysteresis spinboxes are display-only
 # (disabled) in this calibrated-floor design, since there's no live
@@ -71,6 +70,21 @@ CALIBRATION_DURATION_SEC = 1.5   # how long to listen quietly before fixing the 
 # does not touch these — only the floor).
 TOUCH_ON_THRESHOLD_DB  = 8.0
 TOUCH_OFF_THRESHOLD_DB = 5.0
+
+# Material -> (on_threshold_db, off_threshold_db). Different surfaces pick
+# up finger contact at different loudness relative to their own ambient
+# noise, so a threshold tuned for wood can be way too sensitive (or not
+# sensitive enough) on acrylic. Applied on every material switch (button
+# click or startup), same as MATERIAL_PRESETS' band above — edit this
+# dict and reselect the material (or restart) to pick up new values, no
+# code changes needed elsewhere. A material missing from this dict falls
+# back to TOUCH_ON_THRESHOLD_DB / TOUCH_OFF_THRESHOLD_DB above.
+MATERIAL_THRESHOLDS = {
+    'wood':    (25.0, 22.0),
+    'paper':   (8.0, 5.0),
+    'fabric':  (8.0, 5.0),
+    'acrylic': (8.0, 5.0),
+}
 
 TOUCH_MIN_ON_MS_DEFAULT  = 30.0
 TOUCH_MIN_OFF_MS_DEFAULT = 100.0

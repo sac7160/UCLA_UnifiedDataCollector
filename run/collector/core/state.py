@@ -118,7 +118,7 @@ imu_rolling:         "deque" = deque()   # (ts, sensor, v1, v2, v3, watch_ts_ms)
 watch_audio_rolling: "deque" = deque()   # (ts, raw_bytes, watch_ts_ms)
 
 trial_dataset_root = None   # Path — set from --dataset-root in main()
-trial_margin: float = 0.1   # trimmed inward from both REC start/stop, on every trial (human reaction delay to the spacebar press)
+trial_margin: float = 0.0#0.1   # trimmed inward from both REC start/stop, on every trial (human reaction delay to the spacebar press)
 
 # ─── Surface mic filter state (touch_detection.py owns) ──────────────────────
 mic_target_ch = 0   # 0-indexed, set from --mic-channel
