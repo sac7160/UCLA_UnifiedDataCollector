@@ -194,11 +194,18 @@ def heartbeat_thread_fn(interval_sec: float = 3.0):
             state.heartbeat_audio_frames = 0
             state.heartbeat_imu_acc = 0
             state.heartbeat_imu_gyro = 0
+        # video_frames_dropped is a cumulative count written unlocked by the camera
+        # subprocess's bridge thread (single writer, same pattern as watch_rms/mic_rms)
+        # — piggybacked here rather than a suffix so drops are visible live instead of
+        # only in session.py's post-hoc summary.
+        video_dropped = state.video_frames_dropped
+        video_suffix = f'  video_dropped={video_dropped}' if video_dropped else ''
         if frames == 0 and acc == 0 and gyro == 0:
-            log('NET', f'no watch data in the last {interval_sec:.0f}s — check the watch app is still streaming')
+            log('NET', f'no watch data in the last {interval_sec:.0f}s — '
+                        f'check the watch app is still streaming{video_suffix}')
         else:
             log('NET', f'receiving OK — watch_audio: {frames} frames, IMU: acc={acc} gyro={gyro} '
-                        f'(last {interval_sec:.0f}s)')
+                        f'(last {interval_sec:.0f}s){video_suffix}')
 
 
 def net_thread_fn(watch_port: int):

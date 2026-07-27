@@ -56,6 +56,9 @@ traj_fp = None
 traj_writer = None
 traj_flush_n = 0
 
+video_frames_dropped: int = 0   # latest cumulative count from the camera subprocess's video-writer
+                                 # queue (see camera.py) — surfaced by watch_network.py's heartbeat
+
 events_fp = None
 events_writer = None
 event_log: list = []   # (ts, event) for the whole session — see trial.write_event()/write_event_at();

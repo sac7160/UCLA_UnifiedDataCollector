@@ -36,6 +36,29 @@ FINGER_NAMES = ['thumb', 'index', 'middle', 'ring', 'pinky']
 # ─── Index-finger trajectory (see trajectory_calibration.py) ──────────────────
 TRAJ_TRAIL_MAXLEN = 150   # points kept for the instructor window's live trail plot
 
+# ─── Camera raw video recording ────────────────────────────────────────────
+# MJPG is deliberately chosen over an inter-frame codec (mp4v/avc1): every
+# frame is independently JPEG-encoded, so there's no encoder lookahead/
+# backlog risk under load, MJPG/.avi support is close to universal across
+# OpenCV builds (H.264 availability depends on how the local OpenCV was
+# compiled), and — the property session.py's _extract_trial_videos() relies
+# on — an all-intra file has no keyframe intervals, so `ffmpeg -c copy` can
+# cut it at any frame boundary losslessly. Fourcc and extension are paired;
+# change both together.
+CAM_VIDEO_CODEC             = 'MJPG'
+CAM_VIDEO_EXT                = '.avi'
+CAM_VIDEO_FALLBACK_FPS       = 30.0   # used only if cap.get(cv2.CAP_PROP_FPS) is 0/invalid — container
+                                       # metadata only, camera_frames.csv is the source of truth for
+                                       # actual per-frame timing (cap.read() isn't perfectly periodic)
+CAM_VIDEO_QUEUE_MAXSIZE      = 60     # in-process queue.Queue depth inside the camera subprocess (~2s @30fps)
+CAM_VIDEO_DRAIN_TIMEOUT_SEC  = 3.0    # camera_process_fn's own deadline for flushing the writer backlog at
+                                       # shutdown — keep run.py's cam_proc.join(timeout=...) comfortably above this
+CAM_VIDEO_FPS_CORRECTION_THRESHOLD = 0.05   # relative difference (vs CAM_VIDEO_FALLBACK_FPS) above which
+                                             # session.py's _fix_video_framerate() remuxes camera_raw.avi with
+                                             # the true measured fps from camera_frames.csv's own timestamps —
+                                             # the live recording fps is only ever a provisional guess (see
+                                             # camera.py), this is what makes it correct after the fact
+
 # ─── Session / dataset ────────────────────────────────────────────────────────
 DATA_ROOT      = Path('data')
 SESSION_PREFIX = 'session'

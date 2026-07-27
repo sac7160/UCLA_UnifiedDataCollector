@@ -15,6 +15,8 @@ sense once the whole session's data is on disk:
 
 import csv
 import json
+import shutil
+import subprocess
 import time
 import wave
 from datetime import datetime
@@ -115,6 +117,8 @@ def close_session():
         print(f'\n[SESSION] Saved -> {state.session_dir}')
         _check_watch_connection_quality()
         _recalibrate_session_trials(state.session_dir, state.trial_dataset_root)
+        _fix_video_framerate(state.session_dir)
+        _extract_trial_videos(state.session_dir, state.trial_dataset_root)
 
 
 def _check_watch_connection_quality():
@@ -129,6 +133,163 @@ def _check_watch_connection_quality():
     ratio = watch_elapsed / pc_elapsed
     print(f'[QUALITY] watch-clock elapsed={watch_elapsed:.2f}s  '
           f'PC-clock elapsed={pc_elapsed:.2f}s  ratio={ratio:.2%}')
+
+
+def _fix_video_framerate(session_dir: Path):
+    """cv2.VideoWriter needs a fixed fps up front, but camera_process_fn's
+    real achieved capture rate (cap.read() + MediaPipe inference every
+    frame) is neither known in advance nor constant — config.CAM_VIDEO_FALLBACK_FPS
+    is only ever a provisional guess (see camera.py, which deliberately
+    doesn't even try cap.get(CAP_PROP_FPS): queried before any frame has
+    been read, that's commonly wrong too). If the guess is off from the
+    true average rate, two things break: played back, camera_raw.avi looks
+    sped up or slowed down relative to what actually happened, AND —
+    because _extract_trial_videos()'s -ss/-to below is evaluated against
+    the container's own internal timestamp track, not real wall-clock
+    seconds — per-trial extraction can seek to the wrong content entirely,
+    including past the container's own (wrong) idea of where the stream
+    ends, silently producing no output for that trial.
+
+    Fixed by relabeling with the true fps measured from camera_frames.csv's
+    own per-frame timestamps — the same ground-truth file everything else in
+    this pipeline already trusts over container metadata. `ffmpeg -r
+    <true_fps> -i ... -c copy` (as an INPUT option, before -i) discards the
+    container's existing timestamps and regenerates them at the given
+    constant rate; combined with -c copy this is a pure relabel, no
+    re-encoding, safe for the same all-intra reason _extract_trial_videos()
+    below trusts frame indices to stay meaningful. Independent of it
+    though — that function matches frames by their own real timestamps,
+    never the container's PTS, so the two can run in either order."""
+    video_path = session_dir / f'camera_raw{config.CAM_VIDEO_EXT}'
+    frames_path = session_dir / 'camera_frames.csv'
+    if not video_path.exists() or not frames_path.exists() or shutil.which('ffmpeg') is None:
+        return
+
+    with open(frames_path) as f:
+        rows = list(csv.DictReader(f))
+    if len(rows) < 2:
+        return
+    first_ts = float(rows[0]['timestamp_sec'])
+    last_ts = float(rows[-1]['timestamp_sec'])
+    span = last_ts - first_ts
+    if span <= 0:
+        return
+    true_fps = (len(rows) - 1) / span
+
+    if abs(true_fps - config.CAM_VIDEO_FALLBACK_FPS) / true_fps < config.CAM_VIDEO_FPS_CORRECTION_THRESHOLD:
+        return   # close enough to the provisional recording-time value — skip the remux
+
+    fixed_path = video_path.with_name(video_path.stem + '_fixed' + video_path.suffix)
+    result = subprocess.run(
+        ['ffmpeg', '-y', '-r', f'{true_fps:.4f}', '-i', str(video_path), '-c', 'copy', str(fixed_path)],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    if result.returncode != 0 or not fixed_path.exists():
+        print(f'[SESSION] video frame-rate correction failed, leaving camera_raw.avi as-recorded '
+              f'(measured {true_fps:.2f}fps vs {config.CAM_VIDEO_FALLBACK_FPS:.2f}fps recorded): '
+              f'{result.stdout[-500:]}')
+        return
+    fixed_path.replace(video_path)
+    print(f'[SESSION] corrected camera_raw{config.CAM_VIDEO_EXT} frame rate '
+          f'{config.CAM_VIDEO_FALLBACK_FPS:.2f} -> {true_fps:.2f} fps (measured from camera_frames.csv)')
+
+
+def _extract_trial_videos(session_dir: Path, dataset_root: Path):
+    """Crops the session's camera_raw.avi into a per-trial camera_raw.avi
+    under each dataset/<label>/trial_XXX/, using camera_frames.csv's own
+    per-frame timestamps to decide exactly which frames belong to each
+    trial — deliberately NOT ffmpeg time-based seeking (-ss/-to), which was
+    the previous approach here and is wrong for this data: -ss/-to seeks
+    against the container's own internal timestamp track, which reflects
+    whatever fps was declared when camera_raw.avi was written (see
+    camera.py / _fix_video_framerate above). Even after that correction,
+    the declared rate is a single session-wide average, not the true
+    variable per-frame timing — real capture rate isn't constant
+    (cap.read() + MediaPipe inference per frame varies), so a time-based
+    seek can land on the wrong frames whenever the real local rate around a
+    given trial differs from the session-wide average, which is exactly
+    what produced trial clips with the wrong content. This is the same
+    class of bug already fixed once for fingertip_imu.csv/trajectory.csv:
+    trust each record's own explicit timestamp, never a single derived or
+    assumed rate.
+
+    frame_idx N in camera_raw.avi is exactly camera_frames.csv row N's
+    frame — both are written in lockstep, one row per actually-written
+    frame, by camera._video_writer_loop() (a frame dropped under
+    backpressure never gets a CSV row either — see its docstring) — so
+    matching by real timestamp here and then seeking to that literal frame
+    index via cv2.CAP_PROP_POS_FRAMES (exact for an all-intra codec like
+    MJPG — no keyframe-snapping ambiguity, unlike an inter-frame codec)
+    gives the correct frames regardless of how uneven the real capture rate
+    was anywhere in the session.
+
+    Runs after cam_proc has fully exited (see run.py's _shutdown ordering),
+    so camera_raw.avi/camera_frames.csv are guaranteed finalized and in
+    sync. No ffmpeg dependency — unlike _fix_video_framerate above, this
+    doesn't need it."""
+    video_path = session_dir / f'camera_raw{config.CAM_VIDEO_EXT}'
+    frames_path = session_dir / 'camera_frames.csv'
+    if not video_path.exists() or not frames_path.exists():
+        return
+    with open(frames_path) as f:
+        frame_ts = [float(r['timestamp_sec']) for r in csv.DictReader(f)]
+    if not frame_ts:
+        return
+
+    metadata_path = dataset_root / 'metadata.csv'
+    if not metadata_path.exists():
+        return
+    session_name = session_dir.name
+    with open(metadata_path) as f:
+        trials = [row for row in csv.DictReader(f) if row['session'] == session_name]
+    if not trials:
+        return
+
+    import cv2 as _cv2   # only needed if there's actually something to extract
+
+    cap = _cv2.VideoCapture(str(video_path))
+    if not cap.isOpened():
+        print(f'[SESSION] could not open {video_path} for per-trial video extraction')
+        return
+    w = int(cap.get(_cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(_cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = _cv2.VideoWriter_fourcc(*config.CAM_VIDEO_CODEC)
+    session_fps = cap.get(_cv2.CAP_PROP_FPS) or config.CAM_VIDEO_FALLBACK_FPS
+
+    for trial in trials:
+        label = trial['label']; trial_idx = int(trial['trial_idx'])
+        trial_start = float(trial['start_sec']); trial_end = float(trial['end_sec'])
+        trial_dir = dataset_root / label / f'trial_{trial_idx:03d}'
+        if not trial_dir.exists():
+            continue
+
+        matching = [i for i, ts in enumerate(frame_ts) if trial_start <= ts <= trial_end]
+        if not matching:
+            print(f'[SESSION] no camera frames fell within {label}/trial_{trial_idx:03d}\'s '
+                  f'[{trial_start:.3f}, {trial_end:.3f}]s window — skipping video for this trial')
+            continue
+        start_idx, end_idx = matching[0], matching[-1]
+
+        # Trial-local average rate (from just this trial's own matched frames) is a better
+        # playback-speed estimate for the cropped clip than the session-wide average — same
+        # "trust the real local data over a global assumption" reasoning as the frame matching
+        # above, just applied to the clip's own declared fps too.
+        if end_idx > start_idx:
+            trial_fps = (end_idx - start_idx) / (frame_ts[end_idx] - frame_ts[start_idx])
+        else:
+            trial_fps = session_fps
+
+        out_path = trial_dir / f'camera_raw{config.CAM_VIDEO_EXT}'
+        writer = _cv2.VideoWriter(str(out_path), fourcc, trial_fps, (w, h))
+        cap.set(_cv2.CAP_PROP_POS_FRAMES, start_idx)
+        for _ in range(start_idx, end_idx + 1):
+            ok, frame = cap.read()
+            if not ok:
+                break
+            writer.write(frame)
+        writer.release()
+
+    cap.release()
 
 
 def _read_wav_samples(path: Path):

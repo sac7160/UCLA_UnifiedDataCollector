@@ -38,6 +38,7 @@ Usage:
 
 import argparse
 import multiprocessing as mp
+import shutil
 import signal
 import sys
 import threading
@@ -82,6 +83,10 @@ def main():
     parser.add_argument('--camera-pitch-deg', type=float, default=None)
     parser.add_argument('--camera-roll-deg', type=float, default=0.0)
     parser.add_argument('--no-camera', action='store_true')
+    parser.add_argument('--no-video-record', action='store_true',
+                         help='disable raw camera video recording (camera_raw.avi + camera_frames.csv). '
+                              'On by default whenever the camera is enabled; MediaPipe tracking itself '
+                              'is unaffected either way.')
     parser.add_argument('--mirror', action='store_true',
                          help='mirror the camera feed horizontally before MediaPipe processes it. '
                               'Off by default so hand_label and every x-coordinate '
@@ -220,12 +225,18 @@ def main():
 
     cam_proc = cam_bridge_t = record_queue = cam_stop_flag = None
     if not args.no_camera:
+        record_video = not args.no_video_record
+        if record_video and shutil.which('ffmpeg') is None:
+            print('[RUN] ffmpeg not found on PATH — camera_raw.avi will still be recorded per-session '
+                  'and cropped into each trial folder (that no longer needs ffmpeg), but the '
+                  'session-level file\'s playback-speed correction (cosmetic only) will be skipped.')
         record_queue = mp.Queue(maxsize=8)
         cam_stop_flag = mp.Event()
         cam_proc = mp.Process(
             target=camera_process_fn,
             args=(args.camera_index, args.camera_pitch_deg, args.camera_roll_deg,
-                  state.session_start_wall, record_queue, cam_stop_flag, camera_calibration, args.mirror),
+                  state.session_start_wall, state.session_dir, record_queue, cam_stop_flag,
+                  camera_calibration, args.mirror, record_video),
             daemon=True,
         )
         cam_proc.start()
@@ -297,7 +308,11 @@ def main():
         watch_imu_worker_t.join(timeout=2.0)
         heartbeat_t.join(timeout=2.0)
         if cam_proc:
-            cam_proc.join(timeout=2.0)
+            # 5s (not 2s): needs to leave room for the video writer thread inside
+            # cam_proc to drain a queued backlog and release() the VideoWriter —
+            # falling through to terminate() below would skip that and risk a
+            # corrupt camera_raw.avi. See config.CAM_VIDEO_DRAIN_TIMEOUT_SEC.
+            cam_proc.join(timeout=5.0)
             if cam_proc.is_alive():
                 cam_proc.terminate()
         if cam_bridge_t:
