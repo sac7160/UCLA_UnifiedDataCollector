@@ -3,4 +3,8 @@ __pycache__/
 *.pyc
 .gradle/
 .idea/
-local.properties
+local.properties/
+data/
+dataset
+.DS_Store
+run/calibration.json
