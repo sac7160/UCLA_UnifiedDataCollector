@@ -20,10 +20,14 @@ touch_detection.py splits the mic path:
 
   watch_audio_worker_fn()  Owns state.watch_wf (the session watch_audio.wav
                             handle) — all writes to it happen on this one
-                            thread. Also handles the '__RTEND__' sentinel
-                            that closes the file, queued in-order relative
-                            to real frames so it can never race a
-                            still-pending write.
+                            thread. The file is opened once at session start
+                            and closed once at session end (session.py),
+                            same lifecycle as imu.csv — NOT reopened/closed
+                            per RTBGN/RTEND, so a watch reconnect mid-session
+                            (recording stopped and restarted on the watch,
+                            or a dropped connection) keeps appending to the
+                            same file instead of silently losing everything
+                            recorded after the first RTEND.
 
   watch_imu_worker_fn()    Parses and writes watch IMU packets.
 """
@@ -124,7 +128,6 @@ def dispatch_watch_packet(pkt: bytes, arrival_pc: float):
                 state.sync['rtend_watch_ms'] = watch_ms
                 state.sync['rtend_pc_sec'] = pc_sec
             log('NET', f'RTEND  watch_ms={watch_ms}  pc_sec={pc_sec:.4f}s')
-        state.watch_audio_queue.put(('__RTEND__', arrival_pc))
     elif hdr == 'SOUND':
         raw = pkt[10:]
         buf = np.frombuffer(raw[:len(raw)//2*2], dtype='<i2')
@@ -145,12 +148,6 @@ def watch_audio_worker_fn():
             continue
 
         try:
-            if item == '__RTEND__':
-                if state.watch_wf:
-                    state.watch_wf.close()
-                    state.watch_wf = None
-                continue
-
             pkt = item
             arrival_offset = arrival_pc - state.session_start
             total = len(pkt)

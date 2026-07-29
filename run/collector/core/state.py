@@ -176,7 +176,7 @@ material_change_queue: "queue.Queue" = queue.Queue(maxsize=1)   # (name, band_lo
 # ─── Inter-thread queues ──────────────────────────────────────────────────────
 audio_process_queue: "queue.Queue" = queue.Queue()   # (raw, amplified, frames, arrival_pc) -> touch_detection worker
 mic_wav_queue:       "queue.Queue" = queue.Queue()   # raw int16 PCM bytes -> mic wav writer
-watch_audio_queue:   "queue.Queue" = queue.Queue()   # (payload, arrival_pc) or ('__RTEND__', ts) -> watch audio worker
+watch_audio_queue:   "queue.Queue" = queue.Queue()   # (payload, arrival_pc) -> watch audio worker
 watch_imu_queue:     "queue.Queue" = queue.Queue()   # (payload, sensor, arrival_pc) -> watch IMU worker
 
 # ─── Instructor -> experimenter shared text ──────────────────────────────────

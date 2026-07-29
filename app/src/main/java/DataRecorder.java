@@ -47,7 +47,6 @@ public class DataRecorder {
     private int BUFFER_SIZE = AudioRecord.getMinBufferSize(RECORDING_RATE, CHANNEL, FORMAT);
 
     boolean currentlyRecordingAudio = false;
-    boolean sendMsg;
 
     // Number of bytes used for the per-frame capture timestamp prefix
     // (a big-endian long / System.currentTimeMillis()).
@@ -221,44 +220,32 @@ public class DataRecorder {
 
     // ── Audio streaming ──────────────────────────────────────────────────────
 
-    public void startStreamingAudio(String ip, int duration, int id) {
+    public void startStreamingAudio(String ip) {
         currentIp = ip;   // save IP for IMU streaming
         startPersistentConnectionIfNeeded(ip);
         currentlyRecordingAudio = true;
-        sendMsg = true;
-        startStreaming(ip, duration, id);
+        startStreaming(ip);
     }
 
+    /** Ends the current recording — audio stops on its next read() cycle
+     * (sending RTEND), and any buffered-but-not-yet-flushed IMU samples are
+     * flushed immediately so nothing sits unsent past the stop. Recording
+     * has no fixed duration: it runs until this is called. */
     public void stopStreamingAudio() {
-        stopStreamingAudio(true);
-    }
-
-    private void stopStreamingAudio(boolean sendMsgIn) {
-        sendMsg = sendMsgIn;
         currentlyRecordingAudio = false;
-        // Flush remaining IMU samples on stop
         flushImu("IMUAC", accBuffer);
         flushImu("IMUGY", gyrBuffer);
     }
 
-    private void startStreaming(final String ip, final int duration, final int id) {
+    private void startStreaming(final String ip) {
         recordingStartTime = recordingStopTime = -1;
         Thread streamThread = new Thread(new Runnable() {
             @SuppressLint("MissingPermission")
             @Override
             public void run() {
                 BUFFER_SIZE = MAX_FRAME_SIZE * 2;
-                int maxPackets = duration * (AUDIO_SAMPLE_RATE / MAX_FRAME_SIZE);
-
-                int extraBytes = 10;
-                byte[] buffer = new byte[extraBytes + (BUFFER_SIZE * maxPackets)];
-
-                buffer[0]='S'; buffer[1]='O'; buffer[2]='U'; buffer[3]='N'; buffer[4]='D';
-                byte[] num = Utilities.leftPad(Integer.toString(id), 5).getBytes();
-                buffer[5]=num[0]; buffer[6]=num[1]; buffer[7]=num[2];
-                buffer[8]=num[3]; buffer[9]=num[4];
-
-                int count = 0;
+                byte[] audioBuf = new byte[BUFFER_SIZE];   // reused every frame — recording length isn't known up front
+                long count = 0;
 
                 try {
                     recorder = new AudioRecord(device, RECORDING_RATE, CHANNEL, FORMAT, BUFFER_SIZE);
@@ -282,11 +269,9 @@ public class DataRecorder {
 
                     recorder.startRecording();
                     recordingStartTime = System.currentTimeMillis();
-                    Log.w(TAG, "Log/ maxPackets: " + maxPackets);
 
                     while (currentlyRecordingAudio) {
-                        int start = extraBytes + (BUFFER_SIZE * count);
-                        int read = recorder.read(buffer, start, BUFFER_SIZE);
+                        recorder.read(audioBuf, 0, BUFFER_SIZE);
                         // Plain real-time measurement, with NO fixed
                         // correction applied. Two different correction
                         // attempts were tried here (a pure count*duration
@@ -302,82 +287,57 @@ public class DataRecorder {
                         // on this device), not another assumption.
                         long frameTs = System.currentTimeMillis();
 
-                        if (count == maxPackets) {
-                            if (Utilities.IsRealtimeStreaming) {
-                                buffer[0]='R'; buffer[1]='T'; buffer[2]='E'; buffer[3]='N'; buffer[4]='D';
-                                // Unlike frame timestamps above, this reads the
-                                // real wall clock on purpose: RTEND's whole
-                                // job is to measure how much real time has
-                                // actually elapsed, so the PC side can compare
-                                // it against RTBGN and correct for any drift
-                                // between the nominal audio-clock timeline and
-                                // real time (see _recalibrate_session_trials
-                                // on the PC side).
-                                long t = System.currentTimeMillis();    //for sync with surface microphone
-                                buffer[5]=(byte)(t>>56); buffer[6]=(byte)(t>>48);
-                                buffer[7]=(byte)(t>>40); buffer[8]=(byte)(t>>32);
-                                buffer[9]=(byte)(t>>24); buffer[10]=(byte)(t>>16);
-                                buffer[11]=(byte)(t>>8); buffer[12]=(byte)(t);
-                                send_request(ip, buffer, 13);
-                            }
-                            currentlyRecordingAudio = false;
-                        } else {
-                            if (Utilities.IsRealtimeStreaming) {
-                                int end = start + BUFFER_SIZE;
+                        // Every audio frame — including frame 0 — is sent as
+                        // [8-byte big-endian timestamp][BUFFER_SIZE bytes of
+                        // PCM audio].
+                        byte[] framePkt = new byte[FRAME_TS_BYTES + BUFFER_SIZE];
+                        writeLongBE(framePkt, 0, frameTs);
+                        System.arraycopy(audioBuf, 0, framePkt, FRAME_TS_BYTES, BUFFER_SIZE);
+                        send_request(ip, framePkt, framePkt.length);
 
-                                // Every audio frame — including frame 0 — is sent
-                                // as [8-byte big-endian timestamp][BUFFER_SIZE
-                                // bytes of PCM audio]. Frame 0's audio used to be
-                                // silently dropped (only the RTBGN header was
-                                // sent for it); it's now sent like every other
-                                // frame, just with its own timestamp attached.
-                                byte[] framePkt = new byte[FRAME_TS_BYTES + BUFFER_SIZE];
-                                framePkt[0] = (byte)(frameTs >> 56);
-                                framePkt[1] = (byte)(frameTs >> 48);
-                                framePkt[2] = (byte)(frameTs >> 40);
-                                framePkt[3] = (byte)(frameTs >> 32);
-                                framePkt[4] = (byte)(frameTs >> 24);
-                                framePkt[5] = (byte)(frameTs >> 16);
-                                framePkt[6] = (byte)(frameTs >> 8);
-                                framePkt[7] = (byte)(frameTs);
-                                System.arraycopy(buffer, start, framePkt, FRAME_TS_BYTES, BUFFER_SIZE);
-                                send_request(ip, framePkt, framePkt.length);
-
-                                if (count == 0) {
-                                    // Announce stream start via RTBGN, as before.
-                                    // This overwrites buffer[0..12], which overlaps
-                                    // frame 0's storage slot (buffer[10..12]) — that's
-                                    // harmless now since frame 0's audio was already
-                                    // copied out into framePkt above before this point.
-                                    //
-                                    // Reuses this iteration's frameTs (not a
-                                    // fresh System.currentTimeMillis() call)
-                                    // so RTBGN's watch_ms is exactly identical
-                                    // to frame 0's own timestamp — both are
-                                    // the same corrected real-time reading.
-                                    buffer[0]='R'; buffer[1]='T'; buffer[2]='B'; buffer[3]='G'; buffer[4]='N';
-                                    long t = frameTs;
-                                    buffer[5]=(byte)(t>>56); buffer[6]=(byte)(t>>48);
-                                    buffer[7]=(byte)(t>>40); buffer[8]=(byte)(t>>32);
-                                    buffer[9]=(byte)(t>>24); buffer[10]=(byte)(t>>16);
-                                    buffer[11]=(byte)(t>>8); buffer[12]=(byte)(t);
-                                    send_request(ip, buffer, 13);
-                                }
-                            }
-                            count++;
+                        if (count == 0) {
+                            // Announce stream start via RTBGN. Reuses this
+                            // iteration's frameTs (not a fresh
+                            // System.currentTimeMillis() call) so RTBGN's
+                            // watch_ms is exactly identical to frame 0's own
+                            // timestamp — both are the same corrected
+                            // real-time reading.
+                            send_request(ip, rtHeader("RTBGN", frameTs), 13);
                         }
+                        count++;
                     }
+
+                    // currentlyRecordingAudio was set false by
+                    // stopStreamingAudio() — announce the real stop time so
+                    // the PC side can build its RTBGN/RTEND two-point
+                    // watch-clock<->PC-clock mapping (see
+                    // _recalibrate_session_trials on the PC side). Unlike
+                    // frame timestamps above, this reads the real wall clock
+                    // on purpose: RTEND's whole job is to measure how much
+                    // real time has actually elapsed.
+                    send_request(ip, rtHeader("RTEND", System.currentTimeMillis()), 13);
                     recordingStopTime = System.currentTimeMillis();
                 } catch (Exception e) {
                     Log.w(TAG, "TCP Streamer Exception: " + e);
                 }
                 recorder.stop();
-                if (sendMsg && !Utilities.IsRealtimeStreaming)
-                    send_request(ip, buffer, extraBytes + (BUFFER_SIZE * count));
                 recorder.release();
             }
         });
         streamThread.start();
+    }
+
+    private static byte[] rtHeader(String tag, long t) {
+        byte[] b = new byte[13];
+        System.arraycopy(tag.getBytes(), 0, b, 0, 5);
+        writeLongBE(b, 5, t);
+        return b;
+    }
+
+    private static void writeLongBE(byte[] b, int off, long v) {
+        for (int i = 0; i < 8; i++) {
+            b[off + i] = (byte) (v >> (56 - 8 * i));
+        }
     }
 
     // ── IMU real-time streaming ───────────────────────────────────────────────

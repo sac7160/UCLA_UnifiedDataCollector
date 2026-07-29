@@ -3,7 +3,6 @@
 package com.example.openacousticswatch.presentation
 
 import DataRecorder.dataRecorder
-import Utilities.RecordingTime
 import android.content.Intent
 import android.os.Bundle
 import android.os.Handler
@@ -18,7 +17,7 @@ class LoadingActivity : ComponentActivity() {
         setContentView(R.layout.activity_loading)
 
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        dataRecorder.startStreamingAudio(Utilities.IP, RecordingTime, Utilities.TrialEndCounter)
+        dataRecorder.startStreamingAudio(Utilities.IP)
 
         Handler(Looper.getMainLooper()).postDelayed({
             val capture = Intent(this@LoadingActivity, CaptureActivity::class.java)

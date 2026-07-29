@@ -5,25 +5,22 @@
     android:id="@+id/main"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    tools:context=".presentation.CaptureActivity"
-    android:padding="35dp">
+    tools:context=".presentation.CaptureActivity">
 
-    <TextView
-        android:id="@+id/poseText"
-        android:layout_gravity="center_horizontal"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:textColor="#03A9F4"
-        android:text="Capturing..."
-        android:textSize="20dp"  />
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:theme="@style/DisableSwipeBack"
+        app:layout_boxedEdges="all">
 
-    <ImageView
-        android:id="@+id/poseImg"
-        android:layout_marginTop="20dp"
-        android:layout_gravity="center"
-        android:layout_width="120dp"
-        android:layout_height="120dp"
-        tools:src="@tools:sample/avatars" />
+        <Button
+            android:id="@+id/btn_stop"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#0C0C0C"
+            android:textColor="#03A9F4"
+            android:text="Capturing Data\n\n(tap to stop)"
+            android:textSize="18sp" />
 
-
+    </FrameLayout>
 </androidx.wear.widget.SwipeDismissFrameLayout>

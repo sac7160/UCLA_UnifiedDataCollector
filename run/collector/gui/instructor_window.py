@@ -32,7 +32,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self._metric_min = None
         self._metric_max = None
         self._last_rec_shown = None   # forces the REC button style to be set on the first update() call
-        self._watch_countdown_start_offset = None   # set once, the first time watch data arrives
+        self._watch_stream_start_offset = None   # set once, the first time watch data arrives
         self.setWindowTitle('WristPad — Instructor')
 
         central = QtWidgets.QWidget()
@@ -47,10 +47,10 @@ class InstructorWindow(QtWidgets.QMainWindow):
         rec_row.addWidget(self.rec_btn)
         rec_row.addWidget(QtWidgets.QLabel('  (or press spacebar — press once to start, again to stop)'))
         rec_row.addStretch(1)
-        self.watch_countdown_label = QtWidgets.QLabel('watch: waiting for data...')
-        self.watch_countdown_label.setStyleSheet('font-size: 14px; font-weight: bold; color: #888; '
-                                                   'padding: 2px 10px;')
-        rec_row.addWidget(self.watch_countdown_label)
+        self.watch_status_label = QtWidgets.QLabel('watch: waiting for data...')
+        self.watch_status_label.setStyleSheet('font-size: 14px; font-weight: bold; color: #888; '
+                                                'padding: 2px 10px;')
+        rec_row.addWidget(self.watch_status_label)
         self.status_label = QtWidgets.QLabel('')
         self.status_label.setStyleSheet('font-size: 12px; color: #333;')
         rec_row.addWidget(self.status_label)
@@ -357,27 +357,23 @@ class InstructorWindow(QtWidgets.QMainWindow):
             sb = self.log_view.verticalScrollBar()
             sb.setValue(sb.maximum())   # auto-scroll to the newest line
 
-    def _update_watch_countdown(self, countdown_sec: float = 30.0):
-        """Starts a one-shot 30s countdown the moment watch data first
-        arrives this session — state.watch_audio_offset / state.imu_offset
+    def _update_watch_status(self):
+        """The watch stream has no fixed duration — it runs until manually
+        stopped on the watch — so this just confirms it's alive rather than
+        counting down to a cutoff. state.watch_audio_offset / state.imu_offset
         are each set exactly once, at their stream's first packet (see
         writers.py), so the earlier of the two marks "data has started
         coming in from the watch"."""
-        if self._watch_countdown_start_offset is None:
+        if self._watch_stream_start_offset is None:
             candidates = [o for o in (state.watch_audio_offset, state.imu_offset) if o is not None]
             if not candidates:
                 return   # still waiting — leave the "waiting for data..." text as-is
-            self._watch_countdown_start_offset = min(candidates)
+            self._watch_stream_start_offset = min(candidates)
 
-        remaining = countdown_sec - (offset() - self._watch_countdown_start_offset)
-        if remaining > 0:
-            self.watch_countdown_label.setText(f'watch: {remaining:4.1f}s')
-            color = '#2ca02c' if remaining > 10 else ('#d68910' if remaining > 5 else '#d62728')
-        else:
-            self.watch_countdown_label.setText('watch: 0.0s')
-            color = '#d62728'
-        self.watch_countdown_label.setStyleSheet(f'font-size: 14px; font-weight: bold; color: {color}; '
-                                                  f'padding: 2px 10px;')
+        elapsed = offset() - self._watch_stream_start_offset
+        self.watch_status_label.setText(f'watch: streaming ({elapsed:4.1f}s)')
+        self.watch_status_label.setStyleSheet('font-size: 14px; font-weight: bold; color: #2ca02c; '
+                                               'padding: 2px 10px;')
 
     def update(self):
         self._update_waveform(self.pw_surface_wave, state.disp_surface_wave)
@@ -391,7 +387,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self._update_trajectory()
         self._set_touch_visual(state.touch_on_state, state.touch_metric_db)
         self._update_log_panel()
-        self._update_watch_countdown()
+        self._update_watch_status()
 
         # These are display-only (setEnabled(False) at construction), but
         # were never refreshed here before — so switching material updated
