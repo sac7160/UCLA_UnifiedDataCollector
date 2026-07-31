@@ -2,17 +2,22 @@
 data_collector/gui/instructor_window.py
 ────────────────────────────────────────────────────────────────────────────
 Live waveforms/spectrograms/IMU plots (same as realtime_multimodal_viz.py's
-dashboard) plus REC controls, material presets, and the label field. Reads
-everything it displays from data_collector.core.state — never computes anything
-itself beyond formatting. Its update() is called from data_collector.py's
-QTimer tick; it doesn't schedule its own redraws.
+dashboard) plus REC controls, material presets, and stimulus selection.
+Reads everything it displays from data_collector.core.state — never
+computes anything itself beyond formatting. Its update() is called from
+data_collector.py's QTimer tick; it doesn't schedule its own redraws.
+
+Stimulus selection (writing target + "next" button) replaces the old
+direct letter-picker dropdown — see _pick_next_item()'s docstring for how
+letter/word/sentence map to state.current_label/current_stimulus, and
+core/phrase_set.py for where word/sentence text actually comes from.
 """
 
 import numpy as np
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtGui, QtWidgets
 
-from ..core import config, state, dataset_classes
+from ..core import config, state, phrase_set
 from ..core.utils import offset
 from ..workers.touch_detection import set_material
 from ..workers.trial import toggle_recording
@@ -32,7 +37,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self._metric_min = None
         self._metric_max = None
         self._last_rec_shown = None   # forces the REC button style to be set on the first update() call
-        self._watch_stream_start_offset = None   # set once, the first time watch data arrives
+        self._watch_countdown_start_offset = None   # set once, the first time watch data arrives
         self.setWindowTitle('WristPad — Instructor')
 
         central = QtWidgets.QWidget()
@@ -47,10 +52,10 @@ class InstructorWindow(QtWidgets.QMainWindow):
         rec_row.addWidget(self.rec_btn)
         rec_row.addWidget(QtWidgets.QLabel('  (or press spacebar — press once to start, again to stop)'))
         rec_row.addStretch(1)
-        self.watch_status_label = QtWidgets.QLabel('watch: waiting for data...')
-        self.watch_status_label.setStyleSheet('font-size: 14px; font-weight: bold; color: #888; '
-                                                'padding: 2px 10px;')
-        rec_row.addWidget(self.watch_status_label)
+        self.watch_countdown_label = QtWidgets.QLabel('watch: waiting for data...')
+        self.watch_countdown_label.setStyleSheet('font-size: 14px; font-weight: bold; color: #888; '
+                                                   'padding: 2px 10px;')
+        rec_row.addWidget(self.watch_countdown_label)
         self.status_label = QtWidgets.QLabel('')
         self.status_label.setStyleSheet('font-size: 12px; color: #333;')
         rec_row.addWidget(self.status_label)
@@ -74,21 +79,101 @@ class InstructorWindow(QtWidgets.QMainWindow):
             meta_row.addWidget(btn)
         meta_row.addWidget(self.material_label)
         meta_row.addSpacing(20)
-
-        meta_row.addWidget(QtWidgets.QLabel('class to write:'))
-        self.class_combo = QtWidgets.QComboBox()
-        self.class_combo.addItem('— select —', userData='')
-        for cls in dataset_classes.ALL_CLASSES:
-            self.class_combo.addItem(cls, userData=cls)
-        self.class_combo.setMinimumWidth(160)
-        self.class_combo.currentIndexChanged.connect(self._on_class_changed)
-        meta_row.addWidget(self.class_combo)
-        self.class_preview_label = QtWidgets.QLabel('')
-        self.class_preview_label.setStyleSheet('font-weight: bold; font-size: 16px; padding: 2px 8px;')
-        meta_row.addWidget(self.class_preview_label)
-
-        meta_row.addStretch(1)
         outer.addLayout(meta_row)
+
+        # ── condition row: participant / wrist / finger — pure metadata,
+        # logged with every trial (see trial.toggle_recording()) but never
+        # changes capture behavior; the experimenter arranges the physical
+        # setup (wrist lifted vs. resting, which finger) by hand and just
+        # keeps this in sync with what's actually happening. ──
+        cond_row = QtWidgets.QHBoxLayout()
+        cond_row.addWidget(QtWidgets.QLabel('participant:'))
+        self.participant_edit = QtWidgets.QLineEdit()
+        self.participant_edit.setPlaceholderText('e.g. P1')
+        self.participant_edit.setMaximumWidth(70)
+        self.participant_edit.setText(state.current_participant)
+        # WA_InputMethodEnabled=False turns off IME composition for this
+        # widget entirely — the crash reported wasn't from committed
+        # non-ASCII text (the validator below already blocks that), it was
+        # happening during IME *composition* itself (the "still typing,
+        # not yet committed" state a Korean/Japanese/Chinese input method
+        # goes through before a character is finalized) — which fires
+        # before textChanged and so a validator alone can never catch it.
+        # This tells Qt not to route this widget through the system IME at
+        # all, so composition never starts here in the first place;
+        # keystrokes arrive as plain key events instead. Participant IDs
+        # are simple ASCII identifiers, so there's no legitimate reason
+        # this field would ever need IME composition anyway.
+        self.participant_edit.setAttribute(QtCore.Qt.WA_InputMethodEnabled, False)
+        # Restricted to ASCII letters/digits/underscore/hyphen — belt and
+        # suspenders alongside the IME cutoff above, in case any other
+        # non-ASCII input path (e.g. paste) reaches this field.
+        self.participant_edit.setValidator(
+            QtGui.QRegExpValidator(QtCore.QRegExp(r'[A-Za-z0-9_-]*')))
+        self.participant_edit.textChanged.connect(self._on_participant_changed)
+        cond_row.addWidget(self.participant_edit)
+        cond_row.addSpacing(16)
+
+        cond_row.addWidget(QtWidgets.QLabel('wrist:'))
+        self.wrist_combo = QtWidgets.QComboBox()
+        self.wrist_combo.addItems(config.WRIST_CONDITIONS)
+        self.wrist_combo.setCurrentText(state.current_wrist_condition)
+        self.wrist_combo.currentTextChanged.connect(self._on_wrist_changed)
+        cond_row.addWidget(self.wrist_combo)
+        cond_row.addSpacing(16)
+
+        cond_row.addWidget(QtWidgets.QLabel('finger:'))
+        self.finger_condition_combo = QtWidgets.QComboBox()
+        self.finger_condition_combo.addItems(config.FINGER_CONDITIONS)
+        self.finger_condition_combo.setCurrentText(state.current_finger_condition)
+        self.finger_condition_combo.currentTextChanged.connect(self._on_finger_condition_changed)
+        cond_row.addWidget(self.finger_condition_combo)
+        cond_row.addStretch(1)
+        outer.addLayout(cond_row)
+
+        # ── stimulus row: writing target + next button, replacing the old
+        # direct letter-picker dropdown. See _pick_next_item(). ──
+        stim_row = QtWidgets.QHBoxLayout()
+        stim_row.addWidget(QtWidgets.QLabel('writing target:'))
+        self.target_combo = QtWidgets.QComboBox()
+        self.target_combo.addItems(config.WRITING_TARGETS)
+        self.target_combo.setCurrentText(state.current_writing_target)
+        self.target_combo.currentTextChanged.connect(self._on_target_changed)
+        stim_row.addWidget(self.target_combo)
+
+        self.next_btn = QtWidgets.QPushButton('\u21bb next')
+        self.next_btn.setStyleSheet('font-weight: bold; padding: 4px 10px;')
+        self.next_btn.clicked.connect(self._on_next_clicked)
+        stim_row.addWidget(self.next_btn)
+
+        stim_row.addWidget(QtWidgets.QLabel('to write:'))
+        self.class_preview_label = QtWidgets.QLabel('(press next)')
+        self.class_preview_label.setStyleSheet('font-weight: bold; font-size: 16px; padding: 2px 8px; '
+                                                'background-color: #fffbe6; border-radius: 3px;')
+        self.class_preview_label.setWordWrap(True)
+        stim_row.addWidget(self.class_preview_label, 1)
+        outer.addLayout(stim_row)
+
+        # ── task timer: a plain stopwatch the instructor starts/resets by
+        # hand at each block boundary, to track elapsed time against the
+        # protocol's "2 min writing, 1 min break" structure. Purely a
+        # display — never gates or affects capture. ──
+        timer_row = QtWidgets.QHBoxLayout()
+        timer_row.addWidget(QtWidgets.QLabel('task timer:'))
+        self.task_timer_label = QtWidgets.QLabel('00:00')
+        self.task_timer_label.setStyleSheet(
+            'font-size: 22px; font-weight: bold; font-family: Menlo, Consolas, monospace; '
+            'padding: 4px 14px; background-color: #222; color: #2ecc40; border-radius: 4px;')
+        timer_row.addWidget(self.task_timer_label)
+        self.task_timer_start_btn = QtWidgets.QPushButton('\u25b6 start')
+        self.task_timer_start_btn.clicked.connect(self._on_task_timer_start_clicked)
+        timer_row.addWidget(self.task_timer_start_btn)
+        self.task_timer_reset_btn = QtWidgets.QPushButton('\u25a0 reset')
+        self.task_timer_reset_btn.clicked.connect(self._on_task_timer_reset_clicked)
+        timer_row.addWidget(self.task_timer_reset_btn)
+        timer_row.addWidget(QtWidgets.QLabel('  (green <1:30, amber <2:00, red \u22652:00 — writing-block guide only)'))
+        timer_row.addStretch(1)
+        outer.addLayout(timer_row)
 
         # Threshold/hysteresis are fixed constants in this calibrated-floor
         # design (config.TOUCH_ON_THRESHOLD_DB / TOUCH_OFF_THRESHOLD_DB) —
@@ -193,6 +278,9 @@ class InstructorWindow(QtWidgets.QMainWindow):
         grid.setColumnStretch(0, 1); grid.setColumnStretch(1, 1); grid.setColumnStretch(2, 1)
         self.resize(1650, 1050)
 
+        self._pick_next_item()   # show something before the first REC rather than leaving the
+                                  # preview blank / stimulus at whatever default state.py set
+
     # ── panel builders ──
     def _make_waveform_plot(self, title: str) -> pg.PlotWidget:
         pw = pg.PlotWidget(title=title)
@@ -268,17 +356,79 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self.material_label.setText(f'[{name}] {low:.0f}-{high:.0f}Hz')
         self._reset_minmax()   # old min/max is meaningless once the band changes
 
-    def _on_class_changed(self, index: int):
-        """Updates the live label/stimulus immediately — not just at
-        REC-start — so the experimenter window shows the right thing to
-        write before recording even begins. This directly replaces the
-        old --session-label CLI flag / label text field for per-trial
-        labeling; --session-label still exists, but now only names the
-        session folder (e.g. a participant ID), not what gets written."""
-        cls = self.class_combo.itemData(index)
-        state.current_label = cls
-        state.current_stimulus = cls
-        self.class_preview_label.setText(dataset_classes.display_text_for_label(cls) if cls else '')
+    def _on_participant_changed(self, text: str):
+        state.current_participant = text.strip()
+
+    def _on_wrist_changed(self, text: str):
+        state.current_wrist_condition = text
+
+    def _on_finger_condition_changed(self, text: str):
+        # What the *participant* is instructed to write with — separate
+        # from state.display_finger, which only controls which finger's
+        # fingertip IMU plot is shown live in this window (a visualization
+        # choice, not an experimental condition).
+        state.current_finger_condition = text
+
+    def _on_target_changed(self, text: str):
+        state.current_writing_target = text
+        self._pick_next_item()
+
+    def _on_next_clicked(self):
+        self._pick_next_item()
+
+    def _pick_next_item(self):
+        """Draws a new random stimulus for the current writing target and
+        pushes it live to state.current_label/current_stimulus — mirrors
+        the old class-picker dropdown's behavior of updating the
+        experimenter window immediately, not just at REC-start, so the
+        participant sees what to write before recording begins.
+
+        current_label groups the trial into a dataset folder: the literal
+        letter for writing_target == 'letter' (dataset/<letter>/, same
+        layout the ML pipeline already expects), or the writing_target
+        name itself ('word'/'sentence') for the other two, since a word or
+        sentence isn't a member of a small, fixed class the way a single
+        letter is. current_stimulus is always the literal text to display/
+        write, in every case — see trial.process_trial()'s `content` field
+        for where the ground-truth text ends up saved."""
+        target = state.current_writing_target
+        try:
+            content = phrase_set.random_item(target, config.PHRASE_SET_PATH)
+        except (FileNotFoundError, ValueError) as e:
+            self.class_preview_label.setText('(stimulus unavailable — see log)')
+            print(f'[STIMULUS] {e}')
+            return
+
+        label = content if target == 'letter' else target
+        state.current_label = label
+        state.current_stimulus = content
+        self.class_preview_label.setText(content)
+
+    def _on_task_timer_start_clicked(self):
+        state.task_timer_start = offset()
+
+    def _on_task_timer_reset_clicked(self):
+        state.task_timer_start = None
+        self.task_timer_label.setText('00:00')
+        self.task_timer_label.setStyleSheet(
+            'font-size: 22px; font-weight: bold; font-family: Menlo, Consolas, monospace; '
+            'padding: 4px 14px; background-color: #222; color: #2ecc40; border-radius: 4px;')
+
+    def _update_task_timer(self):
+        if state.task_timer_start is None:
+            return
+        elapsed = offset() - state.task_timer_start
+        mm, ss = divmod(int(elapsed), 60)
+        self.task_timer_label.setText(f'{mm:02d}:{ss:02d}')
+        if elapsed < 90:
+            color = '#2ecc40'
+        elif elapsed < 120:
+            color = '#f1c40f'
+        else:
+            color = '#e74c3c'
+        self.task_timer_label.setStyleSheet(
+            f'font-size: 22px; font-weight: bold; font-family: Menlo, Consolas, monospace; '
+            f'padding: 4px 14px; background-color: #222; color: {color}; border-radius: 4px;')
 
     def _reset_minmax(self):
         self._metric_min = None
@@ -357,23 +507,27 @@ class InstructorWindow(QtWidgets.QMainWindow):
             sb = self.log_view.verticalScrollBar()
             sb.setValue(sb.maximum())   # auto-scroll to the newest line
 
-    def _update_watch_status(self):
-        """The watch stream has no fixed duration — it runs until manually
-        stopped on the watch — so this just confirms it's alive rather than
-        counting down to a cutoff. state.watch_audio_offset / state.imu_offset
+    def _update_watch_countdown(self, countdown_sec: float = 30.0):
+        """Starts a one-shot 30s countdown the moment watch data first
+        arrives this session — state.watch_audio_offset / state.imu_offset
         are each set exactly once, at their stream's first packet (see
         writers.py), so the earlier of the two marks "data has started
         coming in from the watch"."""
-        if self._watch_stream_start_offset is None:
+        if self._watch_countdown_start_offset is None:
             candidates = [o for o in (state.watch_audio_offset, state.imu_offset) if o is not None]
             if not candidates:
                 return   # still waiting — leave the "waiting for data..." text as-is
-            self._watch_stream_start_offset = min(candidates)
+            self._watch_countdown_start_offset = min(candidates)
 
-        elapsed = offset() - self._watch_stream_start_offset
-        self.watch_status_label.setText(f'watch: streaming ({elapsed:4.1f}s)')
-        self.watch_status_label.setStyleSheet('font-size: 14px; font-weight: bold; color: #2ca02c; '
-                                               'padding: 2px 10px;')
+        remaining = countdown_sec - (offset() - self._watch_countdown_start_offset)
+        if remaining > 0:
+            self.watch_countdown_label.setText(f'watch: {remaining:4.1f}s')
+            color = '#2ca02c' if remaining > 10 else ('#d68910' if remaining > 5 else '#d62728')
+        else:
+            self.watch_countdown_label.setText('watch: 0.0s')
+            color = '#d62728'
+        self.watch_countdown_label.setStyleSheet(f'font-size: 14px; font-weight: bold; color: {color}; '
+                                                  f'padding: 2px 10px;')
 
     def update(self):
         self._update_waveform(self.pw_surface_wave, state.disp_surface_wave)
@@ -387,7 +541,8 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self._update_trajectory()
         self._set_touch_visual(state.touch_on_state, state.touch_metric_db)
         self._update_log_panel()
-        self._update_watch_status()
+        self._update_watch_countdown()
+        self._update_task_timer()
 
         # These are display-only (setEnabled(False) at construction), but
         # were never refreshed here before — so switching material updated

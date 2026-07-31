@@ -33,6 +33,18 @@ CAM_EMA_ALPHA        = 0.2
 CAM_FLUSH_EVERY_N    = 10
 FINGER_NAMES = ['thumb', 'index', 'middle', 'ring', 'pinky']
 
+# Requested capture mode — cap.set() with these right after opening the
+# device, before any cap.read(). Not guaranteed to be honored exactly (the
+# driver snaps to its nearest supported mode); camera.py logs what actually
+# got negotiated. Tune the width/height <-> fps tradeoff here for whichever
+# camera is plugged in — e.g. the C920 tops out around 30fps at 1080p,
+# while a camera rated for higher fps at lower resolution (see the ELP
+# swap) may need a smaller CAM_CAPTURE_WIDTH/HEIGHT to actually reach its
+# higher CAM_CAPTURE_FPS_REQUEST.
+CAM_CAPTURE_WIDTH       = 1280#640#1280
+CAM_CAPTURE_HEIGHT      = 720#360#720
+CAM_CAPTURE_FPS_REQUEST = 120#240#120
+
 # ─── Index-finger trajectory (see trajectory_calibration.py) ──────────────────
 TRAJ_TRAIL_MAXLEN = 150   # points kept for the instructor window's live trail plot
 
@@ -59,9 +71,40 @@ CAM_VIDEO_FPS_CORRECTION_THRESHOLD = 0.05   # relative difference (vs CAM_VIDEO_
                                              # the live recording fps is only ever a provisional guess (see
                                              # camera.py), this is what makes it correct after the fact
 
+# ─── Fingertip tracking worker thread (see camera.py's "CAPTURE / TRACKING
+# SPLIT") ────────────────────────────────────────────────────────────────────
+# tracker.update()/compute_trajectory() run on their own thread now, fed by
+# a small bounded queue, instead of inline in the same loop as cap.read() —
+# a slow inference frame used to directly delay the next cap.read() call,
+# which is what caused this pipeline's measured 0-23% fingertip frame-drop
+# rates (varying run to run with how long inference happened to take, not
+# a fixed hardware ceiling). Deliberately kept much smaller than
+# CAM_VIDEO_QUEUE_MAXSIZE: video writing (disk I/O) and MediaPipe inference
+# have very different worst-case stall durations, and a queue this small
+# means a real slowdown shows up as counted drops within a couple frames,
+# not as several seconds of silently growing latency before anything gets
+# dropped.
+CAM_TRACKING_QUEUE_MAXSIZE     = 8     # ~0.3s @ 24fps
+CAM_TRACKING_DRAIN_TIMEOUT_SEC = 2.0   # camera_process_fn's own deadline for the tracking worker to finish
+                                        # processing its backlog at shutdown — keep run.py's
+                                        # cam_proc.join(timeout=...) comfortably above
+                                        # CAM_VIDEO_DRAIN_TIMEOUT_SEC + this, since shutdown drains both
+                                        # in sequence
+
 # ─── Session / dataset ────────────────────────────────────────────────────────
 DATA_ROOT      = Path('data')
 SESSION_PREFIX = 'session'
+
+# ─── Writing stimulus (see core/phrase_set.py) ────────────────────────────────
+# phrases2.txt is NOT bundled here — it's MacKenzie & Soukoreff's own public
+# resource, not something to fork a copy of into this repo. Download it from
+# http://www.yorku.ca/mack/PhraseSets.zip, unzip, and place phrases2.txt at
+# this path (one phrase per line, all-lowercase, no punctuation — exactly
+# the format the zip ships in already).
+PHRASE_SET_PATH = Path(__file__).resolve().parent / 'phrases2.txt'
+WRITING_TARGETS = ['letter', 'word', 'sentence']
+WRIST_CONDITIONS = ['lift', 'fixed']
+FINGER_CONDITIONS = ['index', 'middle']
 
 # ─── Trial buffering ──────────────────────────────────────────────────────────
 ROLLING_RETENTION_SEC = 30.0
@@ -70,14 +113,15 @@ WATCH_AUDIO_GRACE_SEC = 0.5
 
 # ─── Touch detection ──────────────────────────────────────────────────────────
 # Material -> (band_low_hz, band_high_hz) for the touch-detection band-pass.
-# NOTE: all four currently point at the same 3000-6000Hz range (from the
-# acrylic measurements) — this is presumably deliberate for the current
-# test setup, but means the material buttons don't actually change
-# anything but the label/metadata right now. If wood/paper/fabric turn out
-# to need a different band later, only this dict needs updating.
+# Three materials per the final protocol (wood/fabric/acrylic) — paper was
+# dropped from the 3x3 main-task surface factor. NOTE: all three currently
+# point at the same 3000-6000Hz range (from the acrylic measurements) —
+# presumably deliberate for the current test setup, but means the material
+# buttons don't actually change anything but the label/metadata right now.
+# If any of them turn out to need a different band later, only this dict
+# needs updating.
 MATERIAL_PRESETS = {
     'wood':    (3000.0, 6000.0),
-    'paper':   (3000.0, 6000.0),
     'fabric':  (3000.0, 6000.0),
     'acrylic': (3000.0, 6000.0),
 }
@@ -104,7 +148,6 @@ TOUCH_OFF_THRESHOLD_DB = 5.0
 # back to TOUCH_ON_THRESHOLD_DB / TOUCH_OFF_THRESHOLD_DB above.
 MATERIAL_THRESHOLDS = {
     'wood':    (25.0, 22.0),
-    'paper':   (8.0, 5.0),
     'fabric':  (8.0, 5.0),
     'acrylic': (8.0, 5.0),
 }

@@ -108,12 +108,17 @@ trial_buffers = {
     'trajectory': [],
     'mic':       [],
 }
-trial_queue: "queue.Queue" = queue.Queue()   # carries (start, end, snapshot, trigger, label)
+trial_queue: "queue.Queue" = queue.Queue()   # carries (start, end, snapshot, trigger, label,
+                                              # writing_target, content, participant, wrist_condition,
+                                              # finger_condition) — see trial.toggle_recording()
 mic_sr_runtime: int = config.MIC_SR          # updated in main() to the actual mic sample rate in use
 
 rec_active: bool = False
 audio_touch_start: float | None = None   # set while a touch is in progress during REC — see touch_detection.py
-current_label: str = ''         # kept live by the instructor window's class-picker dropdown
+current_label: str = ''         # folder-grouping key for this trial — a literal letter for writing_target
+                                 # "letter" (dataset/<letter>/), or the writing_target name itself
+                                 # ("word"/"sentence") when the actual content isn't a fixed, finite class —
+                                 # see instructor_window.InstructorWindow._pick_next_item()
 
 pending_starts: list = []
 
@@ -143,7 +148,9 @@ disp_watch_gyro = None
 disp_finger_acc  = None
 disp_finger_gyro = None
 disp_trajectory  = None   # TrajectoryTrail — index-fingertip 2D trail, see gui/display_buffers.py
-display_finger = 'index'   # which finger's fingertip IMU is shown; set from --finger / GUI
+display_finger = 'index'   # which finger's fingertip IMU plot is shown live — a GUI/visualization choice,
+                            # separate from current_finger_condition below (which finger the *participant*
+                            # is instructed to write with, logged as trial metadata)
 
 # ─── Touch detection (touch_detection.py owns) ───────────────────────────────
 touch_band_low_hz  = config.MATERIAL_PRESETS['wood'][0]
@@ -176,8 +183,29 @@ material_change_queue: "queue.Queue" = queue.Queue(maxsize=1)   # (name, band_lo
 # ─── Inter-thread queues ──────────────────────────────────────────────────────
 audio_process_queue: "queue.Queue" = queue.Queue()   # (raw, amplified, frames, arrival_pc) -> touch_detection worker
 mic_wav_queue:       "queue.Queue" = queue.Queue()   # raw int16 PCM bytes -> mic wav writer
-watch_audio_queue:   "queue.Queue" = queue.Queue()   # (payload, arrival_pc) -> watch audio worker
+watch_audio_queue:   "queue.Queue" = queue.Queue()   # (payload, arrival_pc) or ('__RTEND__', ts) -> watch audio worker
 watch_imu_queue:     "queue.Queue" = queue.Queue()   # (payload, sensor, arrival_pc) -> watch IMU worker
 
 # ─── Instructor -> experimenter shared text ──────────────────────────────────
-current_stimulus: str = ''   # what the experimenter should write right now
+current_stimulus: str = ''   # the literal text to write right now — a single letter, a word, or a full
+                              # MacKenzie phrase, depending on current_writing_target. Always the actual
+                              # display/ground-truth text now (see phrase_set.py) — nothing downstream
+                              # needs to translate a class code into display text anymore.
+
+# ─── Final protocol conditions (instructor_window.py owns writes) ────────────
+# All four are per-trial metadata, captured at REC-stop time alongside
+# current_label/current_stimulus (see trial.toggle_recording()) and written
+# into both metadata.csv and each trial's trial_info.json — see
+# trial.process_trial(). wrist/finger conditions are physical setup the
+# experimenter arranges by hand; nothing here changes any hardware/capture
+# behavior, they're purely logged.
+current_participant: str = ''        # e.g. "P1" — free text, set once per participant via the instructor window
+current_writing_target: str = 'letter'   # 'letter' / 'word' / 'sentence' — see core/phrase_set.py
+current_wrist_condition: str = 'lift'    # 'lift' (rigid) / 'fixed' (flexible)
+current_finger_condition: str = 'index'  # 'index' / 'middle' — which finger the participant is told to write with
+
+# ─── Task timer (instructor_window.py owns writes) ────────────────────────────
+# Purely a stopwatch display for the instructor to track block timing
+# against the protocol's "2 min writing, 1 min break" structure — doesn't
+# gate or affect what gets captured/saved in any way. None = not running.
+task_timer_start: float | None = None   # offset() value when last started

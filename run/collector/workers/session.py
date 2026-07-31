@@ -117,8 +117,13 @@ def close_session():
         print(f'\n[SESSION] Saved -> {state.session_dir}')
         _check_watch_connection_quality()
         _recalibrate_session_trials(state.session_dir, state.trial_dataset_root)
-        _fix_video_framerate(state.session_dir)
+        # _extract_trial_videos MUST run before _fix_video_framerate, not
+        # after — see _fix_video_framerate's docstring for why. They used
+        # to be documented as order-independent; they aren't. Extraction
+        # needs camera_raw.avi's frame-index-to-content mapping intact,
+        # which the fps remux below can corrupt.
         _extract_trial_videos(state.session_dir, state.trial_dataset_root)
+        _fix_video_framerate(state.session_dir)
 
 
 def _check_watch_connection_quality():
@@ -142,24 +147,38 @@ def _fix_video_framerate(session_dir: Path):
     is only ever a provisional guess (see camera.py, which deliberately
     doesn't even try cap.get(CAP_PROP_FPS): queried before any frame has
     been read, that's commonly wrong too). If the guess is off from the
-    true average rate, two things break: played back, camera_raw.avi looks
-    sped up or slowed down relative to what actually happened, AND —
-    because _extract_trial_videos()'s -ss/-to below is evaluated against
-    the container's own internal timestamp track, not real wall-clock
-    seconds — per-trial extraction can seek to the wrong content entirely,
-    including past the container's own (wrong) idea of where the stream
-    ends, silently producing no output for that trial.
+    true average rate, camera_raw.avi looks sped up or slowed down
+    relative to what actually happened when opened in a normal media
+    player or re-read by something that trusts the container's declared
+    fps for TIMING (as opposed to _extract_trial_videos below, which
+    never does).
 
     Fixed by relabeling with the true fps measured from camera_frames.csv's
     own per-frame timestamps — the same ground-truth file everything else in
-    this pipeline already trusts over container metadata. `ffmpeg -r
-    <true_fps> -i ... -c copy` (as an INPUT option, before -i) discards the
-    container's existing timestamps and regenerates them at the given
-    constant rate; combined with -c copy this is a pure relabel, no
-    re-encoding, safe for the same all-intra reason _extract_trial_videos()
-    below trusts frame indices to stay meaningful. Independent of it
-    though — that function matches frames by their own real timestamps,
-    never the container's PTS, so the two can run in either order."""
+    this pipeline already trusts over container metadata.
+
+    IMPORTANT — this MUST run after _extract_trial_videos, not before
+    (close_session() enforces this order; don't reorder it back). This
+    used to be documented as order-independent, on the assumption that
+    `ffmpeg -r <true_fps> -i ... -c copy` is a pure timestamp relabel that
+    leaves frame content/count untouched. Verified false: at a large
+    correction ratio (this pipeline's fallback of 30fps vs. e.g. ~244fps
+    actually measured after the ELP camera swap — over 8x off, versus the
+    old C920's ~25% correction, which never surfaced this), ffmpeg's own
+    `-r` handling as an INPUT option was observed to preserve the
+    *original* declared duration and reinterpret it at the new fps instead
+    of relabeling the real frame count — inflating the output's own
+    CAP_PROP_FRAME_COUNT by roughly the same ratio as the fps correction
+    (e.g. 300 real frames measured as ~2445 by a naive reopen). Every
+    downstream frame-index seek (cv2's CAP_PROP_POS_FRAMES, exactly what
+    _extract_trial_videos relies on) is computed relative to that inflated
+    count and lands on the wrong real frame — worse the further into the
+    file, which is why later trials in a session drift further from the
+    right content than earlier ones. Since _extract_trial_videos already
+    matches frames purely by their own real timestamps (never the
+    container's declared fps) and needs an intact frame-index mapping,
+    it has to see the pristine, never-remuxed file — hence the order
+    above."""
     video_path = session_dir / f'camera_raw{config.CAM_VIDEO_EXT}'
     frames_path = session_dir / 'camera_frames.csv'
     if not video_path.exists() or not frames_path.exists() or shutil.which('ffmpeg') is None:
@@ -191,7 +210,8 @@ def _fix_video_framerate(session_dir: Path):
         return
     fixed_path.replace(video_path)
     print(f'[SESSION] corrected camera_raw{config.CAM_VIDEO_EXT} frame rate '
-          f'{config.CAM_VIDEO_FALLBACK_FPS:.2f} -> {true_fps:.2f} fps (measured from camera_frames.csv)')
+          f'{config.CAM_VIDEO_FALLBACK_FPS:.2f} -> {true_fps:.2f} fps (measured from camera_frames.csv) — '
+          f'playback-only fix, applied after per-trial video extraction so it can never affect trial content')
 
 
 def _extract_trial_videos(session_dir: Path, dataset_root: Path):
@@ -222,6 +242,14 @@ def _extract_trial_videos(session_dir: Path, dataset_root: Path):
     MJPG — no keyframe-snapping ambiguity, unlike an inter-frame codec)
     gives the correct frames regardless of how uneven the real capture rate
     was anywhere in the session.
+
+    MUST run before _fix_video_framerate, on the pristine never-remuxed
+    camera_raw.avi — see that function's docstring for why: its ffmpeg
+    remux has been observed to inflate the file's own declared frame
+    count, which corrupts exactly the CAP_PROP_POS_FRAMES seeking this
+    function depends on. close_session() calls these in the right order;
+    don't call this function directly on a session that's already had its
+    framerate corrected without re-verifying that's still safe.
 
     Runs after cam_proc has fully exited (see run.py's _shutdown ordering),
     so camera_raw.avi/camera_frames.csv are guaranteed finalized and in
@@ -354,12 +382,6 @@ def _recalibrate_session_trials(session_dir: Path, dataset_root: Path):
                 frame_start_pc = aligned_pc(float(wts_str)) - config.WATCH_AUDIO_LATENCY_SEC
                 start_i = int(fr['sample_offset']); n = int(fr['num_samples'])
                 raw_frames.append((frame_start_pc, wav_samples[start_i:start_i + n]))
-            # Same sample-accurate crop process_trial() uses live — this
-            # used to have its own, coarser whole-frame-inclusion version
-            # here, which silently re-introduced up to ~40ms of slop at
-            # each trial boundary every time a session closed normally and
-            # this recalibration overwrote the live-saved (precisely
-            # cropped) file. See crop_watch_audio_frames's docstring.
             corrected = crop_watch_audio_frames(raw_frames, trial_start, trial_end, config.WATCH_AUDIO_SR)
             if len(corrected):
                 wavfile.write(trial_dir / 'watch_audio.wav', config.WATCH_AUDIO_SR, corrected)

@@ -20,19 +20,24 @@ AUDIO_FILENAMES = {
     'watch':   'watch_audio.wav',
 }
 
-# ─── IMU input (see dataset.py's DigitStrokeDataset._load_imu) ───────────────
-# Both sources end up as the same shape (6 channels x IMU_STEPS: accel x/y/z,
-# gyro x/y/z) — they just start from very differently-shaped CSVs. See
-# dataset.py's _load_imu_fingertip() / _load_imu_watch().
+# ─── IMU input (see dataset.py's load_imu()) ─────────────────────────────────
+# All sources end up as the same shape (6 channels x IMU_STEPS) — they just
+# start from very differently-shaped CSVs, or different columns of the same
+# one. See dataset.py's _load_imu_fingertip() / _load_imu_watch() /
+# _load_imu_fingertip_pos_vel().
 IMU_CHANNELS = ['accel_x', 'accel_y', 'accel_z', 'gyro_x', 'gyro_y', 'gyro_z']
 IMU_STEPS    = 64
 IMU_FILENAMES = {
-    'fingertip': 'fingertip_imu.csv',
-    'watch':     'imu.csv',
+    'fingertip':          'fingertip_imu.csv',
+    'watch':               'imu.csv',
+    'fingertip_position':  'fingertip_imu.csv',   # same file as 'fingertip' — pos_x/y/z + a single
+                                                    # finite-difference velocity, instead of the
+                                                    # doubly-differentiated accel/gyro columns. See
+                                                    # dataset.py's _load_imu_fingertip_pos_vel().
 }
 
 # ─── Defaults (all overridable via CLI args in train.py / test.py) ───────────
-DEFAULT_CLASSES = ['digits_0', 'digits_1', 'digits_2']
+DEFAULT_CLASSES = [f'digits_{d}' for d in range(10)]   # digits_0 .. digits_9
 DEFAULT_FINGER  = 'index'          # only used when --imu-source fingertip
 DEFAULT_AUDIO_SOURCE = 'surface'   # 'surface' (surface_mic.wav) or 'watch' (watch_audio.wav)
 DEFAULT_IMU_SOURCE   = 'fingertip'   # 'fingertip' (fingertip_imu.csv) or 'watch' (imu.csv)

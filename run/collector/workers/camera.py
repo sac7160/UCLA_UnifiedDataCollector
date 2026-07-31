@@ -9,10 +9,11 @@ record_queue; camera_bridge_thread_fn() picks those up and hands them to
 writers.write_fingertip_imu() / writers.write_trajectory().
 
 Each record/traj pair is timestamped inside camera_process_fn(), right after
-cap.read() and before running MediaPipe inference on it — i.e. at true
-capture time, not whenever record_queue happens to get drained. Nothing
-downstream (the queue, the bridge thread) ever needs to re-timestamp
-anything.
+cap.read() and before handing the frame off for MediaPipe inference — i.e.
+at true capture time, not whenever record_queue happens to get drained, and
+not whenever the tracking worker thread (see below) actually gets around to
+running inference on it. Nothing downstream (either queue, either worker
+thread, the bridge thread) ever needs to re-timestamp anything.
 
 Timestamps are anchored via time.time() (wall clock, seconds since epoch),
 NOT time.perf_counter() — perf_counter's docs only guarantee monotonicity
@@ -27,12 +28,33 @@ timeline as the main process's offset() — which is what trial.py's
 process_trial() compares fingertip/trajectory timestamps against when
 cropping a trial window.
 
+CAPTURE / TRACKING SPLIT — why the loop that calls cap.read() never calls
+tracker.update() itself: MediaPipe inference time varies frame to frame
+(hand pose, lighting, occlusion, how many candidate detections it has to
+evaluate), and running it inline in the same loop as cap.read() means a
+single slow-inference frame directly delays the next cap.read() call. On
+this codebase's target camera/OS combination, a delayed cap.read() doesn't
+just arrive late — the driver's own small ring buffer silently drops
+whatever frame(s) arrived while the loop was busy, and how often that
+happens tracks how often inference happens to run slow, not any single
+fixed rate. Measured fingertip frame-drop rates on trials collected before
+this split ranged from 0% to over 20% run to run, which matches "however
+long inference happened to take that trial" far better than a hardware
+frame-rate ceiling. The fix mirrors _video_writer_loop's existing rationale
+("capture path never blocked by disk I/O") one level further: a dedicated
+_tracking_worker_loop thread is now the only thing that ever calls
+tracker.update()/compute_trajectory(), fed by a small bounded queue, so the
+main loop's only job is calling cap.read() as fast as the camera will
+deliver frames, regardless of how long inference on any given frame takes.
+
 Trajectory computation (compute_trajectory, from trajectory_calibration.py)
 reuses the same MediaPipe tracker state as the fingertip IMU records, so it
-costs no extra inference — just a bit of extra arithmetic per frame. The
-`calibration` dict is loaded once in run.py's main() (see
-collector/workers/calibration.py) and passed in here unchanged for the
-lifetime of the process; recalibrating requires restarting collection.
+costs no extra inference — just a bit of extra arithmetic per frame. Both
+now run on the tracking worker thread, not the capture loop, for the same
+reason as tracker.update() above. The `calibration` dict is loaded once in
+run.py's main() (see collector/workers/calibration.py) and passed in here
+unchanged for the lifetime of the process; recalibrating requires
+restarting collection.
 
 `mirror` (--mirror) is off by default: MediaPipe's handedness classification
 and every x-coordinate (x_px, local_x_mm, global_x_mm, ...) are computed
@@ -51,6 +73,22 @@ camera_raw.avi per session, same as every other stream in this pipeline
 (imu.csv, trajectory.csv, both WAVs) — REC on/off never gates what's
 captured here, only what session.py's _extract_trial_videos() later crops
 out of it into each trial's folder, after the session closes.
+
+DROP ACCOUNTING: there are now three independent points a frame's data can
+be dropped at under backpressure, each counted separately since they
+indicate different bottlenecks:
+  video_dropped     capture loop -> video writer thread (video_queue full,
+                     i.e. disk/encode falling behind)
+  tracking_dropped   capture loop -> tracking worker thread (tracking_queue
+                     full, i.e. MediaPipe inference falling behind — this
+                     is the one the capture/tracking split above targets)
+  record_dropped     tracking worker thread -> bridge thread, i.e. across
+                     the process boundary (record_queue full, i.e. the main
+                     process — GUI, audio, watch-network threads — falling
+                     behind draining it)
+All three are threaded through to camera_bridge_thread_fn and exposed on
+`state`, mirroring the state.video_frames_dropped pattern that already
+existed for the video path alone.
 """
 
 from __future__ import annotations
@@ -117,6 +155,39 @@ def _video_writer_loop(video_queue: "queue.Queue", session_dir, codec: str, ext:
         frames_fp.close()
 
 
+def _tracking_worker_loop(tracking_queue: "queue.Queue", tracker, calibration: dict | None,
+                           record_queue: "mp.Queue"):
+    """Drains tracking_queue and is the *only* thing that ever calls
+    tracker.update()/compute_trajectory() — see this module's docstring
+    ("CAPTURE / TRACKING SPLIT") for why inference was moved off the
+    capture loop entirely. record_dropped counts frames whose tracking
+    result couldn't be handed across the process boundary (record_queue
+    full — the main process falling behind), separately from
+    tracking_dropped (counted in camera_process_fn: frames that never even
+    made it INTO this thread's queue, i.e. this thread itself falling
+    behind) — the two indicate different bottlenecks and shouldn't be
+    conflated into one number.
+
+    A None item on tracking_queue is the shutdown sentinel, mirroring
+    _video_writer_loop's convention.
+    """
+    from trajectory_calibration import compute_trajectory
+
+    record_dropped = 0
+    while True:
+        item = tracking_queue.get()
+        if item is None:
+            break
+        frame, ts, video_dropped, tracking_dropped = item
+        h, w = frame.shape[:2]
+        records = tracker.update(frame, timestamp=ts)
+        traj = compute_trajectory(tracker, records, w, h, calibration)
+        try:
+            record_queue.put_nowait((records, traj, video_dropped, tracking_dropped, record_dropped))
+        except queue.Full:
+            record_dropped += 1
+
+
 def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: float,
                        session_start_wall: float, session_dir,
                        record_queue: "mp.Queue", stop_flag: "mp.Event",
@@ -124,7 +195,6 @@ def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: floa
                        record_video: bool = True):
     import cv2 as _cv2
     from fingertip_imu_multi import MultiFingertipIMUTracker, gravity_vector_from_camera_tilt
-    from trajectory_calibration import compute_trajectory
     from ..core import config
 
     gravity_mm_s2 = None
@@ -140,17 +210,35 @@ def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: floa
         record_queue.put(None)
         return
 
+    # Requested BEFORE any cap.read() — a UVC camera picks its actual mode
+    # at the first read otherwise, and changing width/height/fps after
+    # frames have already started flowing can silently fail or force a
+    # brief re-init. Not guaranteed to be honored exactly (the driver
+    # snaps to its nearest supported mode), so the actually-negotiated
+    # values are read back and logged right after — never assume the
+    # request took effect without checking.
+    cap.set(_cv2.CAP_PROP_FRAME_WIDTH, config.CAM_CAPTURE_WIDTH)
+    cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, config.CAM_CAPTURE_HEIGHT)
+    cap.set(_cv2.CAP_PROP_FPS, config.CAM_CAPTURE_FPS_REQUEST)
+    actual_w = cap.get(_cv2.CAP_PROP_FRAME_WIDTH)
+    actual_h = cap.get(_cv2.CAP_PROP_FRAME_HEIGHT)
+    actual_fps = cap.get(_cv2.CAP_PROP_FPS)
+    print(f'[CAMERA] requested {config.CAM_CAPTURE_WIDTH}x{config.CAM_CAPTURE_HEIGHT}'
+          f'@{config.CAM_CAPTURE_FPS_REQUEST}fps — camera reports {actual_w:.0f}x{actual_h:.0f}'
+          f'@{actual_fps:.1f}fps (driver-reported FPS is a nominal value, not a measured one — '
+          f'raw_camera_rate_test.py / camera_frames.csv are what confirm the real achieved rate)')
+
     video_queue = None
     writer_thread = None
     if record_video:
         # NOT cap.get(CAP_PROP_FPS): queried this early (before any frame has
         # actually been read) it's commonly 0 or a stale/nominal value that
-        # doesn't reflect the real achieved rate once MediaPipe inference runs
-        # in this same loop every frame — and getting it right here doesn't
-        # matter anyway, since session.py's _fix_video_framerate() relabels
-        # the container with the true measured fps (from camera_frames.csv's
-        # own per-frame timestamps) once the session ends. This is only ever
-        # a provisional value for the live VideoWriter to be opened with.
+        # doesn't reflect the real achieved rate — and getting it right here
+        # doesn't matter anyway, since session.py's _fix_video_framerate()
+        # relabels the container with the true measured fps (from
+        # camera_frames.csv's own per-frame timestamps) once the session
+        # ends. This is only ever a provisional value for the live
+        # VideoWriter to be opened with.
         fps = config.CAM_VIDEO_FALLBACK_FPS
         video_queue = queue.Queue(maxsize=config.CAM_VIDEO_QUEUE_MAXSIZE)
         writer_thread = threading.Thread(
@@ -161,33 +249,45 @@ def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: floa
         )
         writer_thread.start()
 
+    # See this module's docstring ("CAPTURE / TRACKING SPLIT") — tracker.update()/
+    # compute_trajectory() no longer run in this loop. tracking_queue's maxsize
+    # is deliberately small (config.CAM_TRACKING_QUEUE_MAXSIZE, expected on the
+    # order of a handful of frames): a MediaPipe inference that's genuinely
+    # falling behind should show up as counted drops promptly, not as several
+    # seconds of growing latency silently queued up before anything is dropped.
+    tracking_queue: "queue.Queue" = queue.Queue(maxsize=config.CAM_TRACKING_QUEUE_MAXSIZE)
+    tracking_thread = threading.Thread(
+        target=_tracking_worker_loop,
+        args=(tracking_queue, tracker, calibration, record_queue),
+        daemon=True,
+    )
+    tracking_thread.start()
+
     video_dropped = 0
+    tracking_dropped = 0
     while not stop_flag.is_set():
         success, frame = cap.read()
         if not success:
             continue
         if mirror:
             frame = _cv2.flip(frame, 1)
-        h, w = frame.shape[:2]
         ts = time.time() - session_start_wall
 
         if video_queue is not None:
-            # .copy(): frame is about to be handed to a different thread
-            # (tracker.update() below only reads it via cv2.cvtColor, which
-            # already allocates a new array — this copy isn't strictly
-            # required by today's code, but it's cheap (~1ms at 720p) insurance
-            # against that invariant silently breaking later.
+            # .copy(): frame is about to be handed to another thread (the
+            # video writer). See tracking_queue's .copy() just below for the
+            # same reasoning applied to the tracking path — each queue's
+            # consumer runs independently and at its own pace, so each needs
+            # its own frame, not a shared reference to the same array.
             try:
                 video_queue.put_nowait((frame.copy(), ts))
             except queue.Full:
                 video_dropped += 1
 
-        records = tracker.update(frame, timestamp=ts)
-        traj = compute_trajectory(tracker, records, w, h, calibration)
         try:
-            record_queue.put_nowait((records, traj, video_dropped))
-        except Exception:
-            pass
+            tracking_queue.put_nowait((frame.copy(), ts, video_dropped, tracking_dropped))
+        except queue.Full:
+            tracking_dropped += 1
 
     if video_queue is not None:
         video_queue.put(None)
@@ -195,6 +295,12 @@ def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: floa
         if writer_thread.is_alive():
             print('[CAMERA] video writer thread did not finish flushing in time — '
                   'camera_raw file may be missing trailing frames')
+
+    tracking_queue.put(None)
+    tracking_thread.join(timeout=config.CAM_TRACKING_DRAIN_TIMEOUT_SEC)
+    if tracking_thread.is_alive():
+        print('[CAMERA] tracking worker thread did not finish in time — '
+              'trailing fingertip IMU/trajectory records may be missing')
 
     cap.release()
     tracker.close()
@@ -208,8 +314,10 @@ def camera_bridge_thread_fn(record_queue: "mp.Queue"):
             continue
         if payload is None:
             continue
-        records, traj, video_dropped = payload
+        records, traj, video_dropped, tracking_dropped, record_dropped = payload
         state.video_frames_dropped = video_dropped
+        state.tracking_frames_dropped = tracking_dropped
+        state.record_frames_dropped = record_dropped
         try:
             write_fingertip_imu(records)
             write_trajectory(traj)
