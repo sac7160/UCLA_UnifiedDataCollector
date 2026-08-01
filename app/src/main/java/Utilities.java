@@ -8,10 +8,9 @@ public class Utilities {
     static public String IP = "192.168.0.163";
     static public String SUB_ID = "0";
 
-<<<<<<< Updated upstream
-=======
+
     static public int RecordingTime = 120;
->>>>>>> Stashed changes
+
     static public boolean IsRecordingIMU = true;
     static public int SamplingRate = 48000;
     static public int NofBlocksReps = 30;
