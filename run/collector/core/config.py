@@ -41,9 +41,9 @@ FINGER_NAMES = ['thumb', 'index', 'middle', 'ring', 'pinky']
 # while a camera rated for higher fps at lower resolution (see the ELP
 # swap) may need a smaller CAM_CAPTURE_WIDTH/HEIGHT to actually reach its
 # higher CAM_CAPTURE_FPS_REQUEST.
-CAM_CAPTURE_WIDTH       = 1280#640#1280
-CAM_CAPTURE_HEIGHT      = 720#360#720
-CAM_CAPTURE_FPS_REQUEST = 120#240#120
+CAM_CAPTURE_WIDTH       = 1280
+CAM_CAPTURE_HEIGHT      = 720
+CAM_CAPTURE_FPS_REQUEST = 120
 
 # ─── Index-finger trajectory (see trajectory_calibration.py) ──────────────────
 TRAJ_TRAIL_MAXLEN = 150   # points kept for the instructor window's live trail plot
@@ -59,6 +59,8 @@ TRAJ_TRAIL_MAXLEN = 150   # points kept for the instructor window's live trail p
 # change both together.
 CAM_VIDEO_CODEC             = 'MJPG'
 CAM_VIDEO_EXT                = '.avi'
+CAM_VIDEO_STEM               = 'camera_raw'      # -> camera_raw.avi
+CAM_FRAMES_CSV                = 'camera_frames.csv'
 CAM_VIDEO_FALLBACK_FPS       = 30.0   # used only if cap.get(cv2.CAP_PROP_FPS) is 0/invalid — container
                                        # metadata only, camera_frames.csv is the source of truth for
                                        # actual per-frame timing (cap.read() isn't perfectly periodic)
@@ -90,6 +92,27 @@ CAM_TRACKING_DRAIN_TIMEOUT_SEC = 2.0   # camera_process_fn's own deadline for th
                                         # cam_proc.join(timeout=...) comfortably above
                                         # CAM_VIDEO_DRAIN_TIMEOUT_SEC + this, since shutdown drains both
                                         # in sequence
+
+# ─── Second camera (video-only — see camera.camera2_thread_fn) ────────────────
+# A completely independent capture+write pipeline from the primary camera
+# above, sharing only the codec/ext and _video_writer_loop's implementation
+# (now parameterized by video_stem/frames_csv_name so both cameras can use
+# it without colliding on filenames). Runs as a plain thread in the MAIN
+# process, not a subprocess like camera_process_fn — there's no per-frame
+# MediaPipe inference here to isolate from the GIL, just cap.read() + a
+# queue + disk write, so a thread is enough (see camera2_thread_fn's
+# docstring). Wire it up in run.py's main() alongside the other worker
+# threads; it needs the same session_start_wall the primary camera gets,
+# so both cameras' *_frames.csv timestamps land on the identical timeline
+# session.py's _extract_trial_videos() already crops against.
+CAM2_INDEX                   = 2
+CAM2_CAPTURE_WIDTH            = 1280
+CAM2_CAPTURE_HEIGHT           = 720
+CAM2_CAPTURE_FPS_REQUEST      = 30
+CAM2_VIDEO_STEM               = 'camera2_raw'    # -> camera2_raw.avi, alongside camera_raw.avi
+CAM2_FRAMES_CSV               = 'camera2_frames.csv'
+CAM2_VIDEO_QUEUE_MAXSIZE      = 60
+CAM2_VIDEO_DRAIN_TIMEOUT_SEC  = 3.0
 
 # ─── Session / dataset ────────────────────────────────────────────────────────
 DATA_ROOT      = Path('data')

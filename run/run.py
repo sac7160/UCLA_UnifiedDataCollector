@@ -16,7 +16,9 @@ the collector/ package next to this file, split into three subpackages
         writers.py              write_watch_audio / write_imu / write_fingertip_imu / write_trajectory
         touch_detection.py     mic callback + band-pass/calibration/threshold/debounce
         watch_network.py        watch TCP listener + packet parsing
-        camera.py                MediaPipe fingertip-IMU + trajectory process + bridge thread
+        camera.py                MediaPipe fingertip-IMU + trajectory process + bridge thread,
+                                  plus camera2_thread_fn — a second, video-only camera (no
+                                  MediaPipe) that runs as a plain thread, not a subprocess
         calibration.py           interactive index-fingertip trajectory calibration (subprocess)
         trial.py                 REC toggle, two-tier trial boundaries, trial cropping/saving
     collector/gui/
@@ -34,6 +36,7 @@ Usage:
     python run.py --mic-device 1 --mic-channel 1
     python run.py --dataset-root dataset/ --list-devices
     python run.py --skip-calibration   # reuse calibration.json without the interactive prompt
+    python run.py --no-camera2         # disable the second, video-only camera
 """
 
 import argparse
@@ -61,7 +64,7 @@ from collector.workers.touch_detection import (
 from collector.workers.watch_network import (
     net_thread_fn, watch_audio_worker_fn, watch_imu_worker_fn, heartbeat_thread_fn,
 )
-from collector.workers.camera import camera_process_fn, camera_bridge_thread_fn
+from collector.workers.camera import camera_process_fn, camera_bridge_thread_fn, camera2_thread_fn
 from collector.workers.trial import trial_worker_fn, on_key_press, on_key_release, write_event
 from collector.gui.instructor_window import InstructorWindow
 from collector.gui.experimenter_window import ExperimenterWindow
@@ -87,11 +90,20 @@ def main():
                          help='disable raw camera video recording (camera_raw.avi + camera_frames.csv). '
                               'On by default whenever the camera is enabled; MediaPipe tracking itself '
                               'is unaffected either way.')
+    parser.add_argument('--camera2-index', type=int, default=config.CAM2_INDEX,
+                         help='device index for the second, video-only camera (no MediaPipe tracking — '
+                              'just camera2_raw.avi + camera2_frames.csv, cropped into each trial folder '
+                              'alongside the primary camera\'s files). Runs as a plain thread, not a '
+                              'subprocess — see camera.camera2_thread_fn.')
+    parser.add_argument('--no-camera2', action='store_true',
+                         help='disable the second, video-only camera entirely')
     parser.add_argument('--mirror', action='store_true',
                          help='mirror the camera feed horizontally before MediaPipe processes it. '
                               'Off by default so hand_label and every x-coordinate '
                               '(x_px, local_x_mm, global_x_mm, ...) match true physical left/right; '
-                              'pass this if you specifically want a selfie-style mirrored view instead.')
+                              'pass this if you specifically want a selfie-style mirrored view instead. '
+                              'Only affects the primary (MediaPipe) camera — camera2 has no handedness/'
+                              'coordinate output to mirror.')
     parser.add_argument('--skip-calibration', action='store_true',
                          help="skip the interactive pre-recording trajectory calibration prompt "
                               "(just silently reuses calibration.json if it exists, else records "
@@ -101,8 +113,8 @@ def main():
     parser.add_argument('--session-label', default='',
                          help='optional suffix for the session folder name (e.g. a participant ID) '
                               '— data/session_YYYYMMDD_HHMMSS_<this>/. Does NOT set what gets '
-                              'written; that\'s chosen live from the instructor window\'s class '
-                              'dropdown, per trial.')
+                              'written; that\'s chosen live from the instructor window\'s writing-target '
+                              'controls, per trial — see InstructorWindow._pick_next_item().')
     parser.add_argument('--trial-margin', type=float, default=0.1)
     parser.add_argument('--material', choices=list(config.MATERIAL_PRESETS), default='wood')
     parser.add_argument('--touch-min-on-ms', type=float, default=config.TOUCH_MIN_ON_MS_DEFAULT)
@@ -243,6 +255,26 @@ def main():
         cam_bridge_t = threading.Thread(target=camera_bridge_thread_fn, args=(record_queue,), daemon=True)
         cam_bridge_t.start()
 
+    # Second, video-only camera — a plain thread (not a subprocess like
+    # camera_process_fn above): no MediaPipe inference here, so there's no
+    # CPU-bound per-frame work to isolate from the GIL, just cap.read() + a
+    # queue + disk write (see camera.camera2_thread_fn's docstring). Uses
+    # state.stop_event directly (a threading.Event, shared in-process) —
+    # unlike cam_stop_flag above, which has to be a separate mp.Event
+    # because camera_process_fn runs in an actual subprocess. Started here
+    # (after start_session() above) so state.session_start_wall/session_dir
+    # are already set — this camera's frame timestamps land on the exact
+    # same wall-clock timeline the primary camera and every other stream
+    # already use, with no extra sync step needed.
+    cam2_thread = None
+    if not args.no_camera2:
+        cam2_thread = threading.Thread(
+            target=camera2_thread_fn,
+            args=(args.camera2_index, state.session_start_wall, state.session_dir, state.stop_event),
+            daemon=True,
+        )
+        cam2_thread.start()
+
     trial_worker_t = threading.Thread(target=trial_worker_fn, daemon=True)
     trial_worker_t.start()
 
@@ -260,10 +292,10 @@ def main():
 
     instructor = InstructorWindow(args.window_sec, has_camera=not args.no_camera,
                                    use_opengl=args.opengl)
-    # Per-trial labeling now comes from the instructor window's class-picker
-    # dropdown (see InstructorWindow._on_class_changed), not a CLI flag or
-    # text field — nothing to wire up here. --session-label still exists,
-    # but only names the session folder now (e.g. a participant ID).
+    # Per-trial labeling now comes from the instructor window's writing-
+    # target controls (see InstructorWindow._pick_next_item()), not a CLI
+    # flag or text field — nothing to wire up here. --session-label still
+    # exists, but only names the session folder now (e.g. a participant ID).
 
     experimenter = ExperimenterWindow()
 
@@ -298,7 +330,7 @@ def main():
         if shutdown_done:
             return
         shutdown_done = True
-        state.stop_event.set()
+        state.stop_event.set()   # also what cam2_thread's loop watches — no separate flag needed for it
         if cam_stop_flag:
             cam_stop_flag.set()
         mic_stream.stop(); mic_stream.close()   # stops the callback, so no new items get queued after this
@@ -317,6 +349,13 @@ def main():
                 cam_proc.terminate()
         if cam_bridge_t:
             cam_bridge_t.join(timeout=2.0)
+        if cam2_thread:
+            # 4s: same reasoning as cam_proc's 5s above (room for its own
+            # video writer thread to drain and release() cleanly — see
+            # config.CAM2_VIDEO_DRAIN_TIMEOUT_SEC), just a plain thread so
+            # there's no terminate()-vs-corrupt-file risk to guard against
+            # the way there is for cam_proc.
+            cam2_thread.join(timeout=4.0)
         try:
             key_listener.stop()
         except Exception:

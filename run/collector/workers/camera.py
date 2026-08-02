@@ -103,18 +103,23 @@ from .writers import write_fingertip_imu, write_trajectory
 
 
 def _video_writer_loop(video_queue: "queue.Queue", session_dir, codec: str, ext: str,
-                        fps: float, flush_every_n: int):
+                        fps: float, flush_every_n: int, video_stem: str, frames_csv_name: str):
     """Drains video_queue and is the *only* thing that ever touches
-    cv2.VideoWriter or camera_frames.csv — runs on its own thread inside the
-    camera subprocess so a slow disk/encode call can never delay
-    cap.read()/MediaPipe in camera_process_fn's loop, the same "capture path
-    never blocked by disk I/O" pattern already used for
+    cv2.VideoWriter or this camera's own frames CSV — runs on its own
+    thread so a slow disk/encode call can never delay cap.read()/MediaPipe
+    in the capture loop that feeds it, the same "capture path never
+    blocked by disk I/O" pattern already used for
     touch_detection.mic_wav_writer_fn / watch_network.watch_audio_worker_fn.
+    Shared verbatim by both cameras (camera_process_fn for the primary
+    camera, camera2_thread_fn for the video-only second one) — video_stem/
+    frames_csv_name are the only thing that ever differs between them
+    (config.CAM_VIDEO_STEM/CAM_FRAMES_CSV vs. CAM2_VIDEO_STEM/CAM2_FRAMES_CSV),
+    so the two cameras' output can never collide on the same filenames.
 
-    frame_idx in camera_frames.csv is assigned here, in write order — a
+    frame_idx in <frames_csv_name> is assigned here, in write order — a
     frame dropped upstream under backpressure (video_queue full) never
     reaches this thread, so it never gets a CSV row either; the CSV always
-    describes exactly what's in camera_raw.avi, which is what a later
+    describes exactly what's in <video_stem><ext>, which is what a later
     ffmpeg-based crop (session.py's _extract_trial_videos) or manual review
     needs. The VideoWriter is opened lazily on the first real frame, using
     its actual shape — cap.get(CAP_PROP_FRAME_WIDTH/HEIGHT) can return 0 or
@@ -128,7 +133,7 @@ def _video_writer_loop(video_queue: "queue.Queue", session_dir, codec: str, ext:
     import csv as _csv
 
     writer = None
-    frames_fp = open(session_dir / 'camera_frames.csv', 'w', newline='')
+    frames_fp = open(session_dir / frames_csv_name, 'w', newline='')
     frames_writer = _csv.writer(frames_fp)
     frames_writer.writerow(['frame_idx', 'timestamp_sec'])
     frame_idx = 0
@@ -142,7 +147,7 @@ def _video_writer_loop(video_queue: "queue.Queue", session_dir, codec: str, ext:
             frame, ts = item
             if writer is None:
                 h, w = frame.shape[:2]
-                writer = _cv2.VideoWriter(str(session_dir / f'camera_raw{ext}'), fourcc, fps, (w, h))
+                writer = _cv2.VideoWriter(str(session_dir / f'{video_stem}{ext}'), fourcc, fps, (w, h))
             writer.write(frame)
             frames_writer.writerow([frame_idx, f'{ts:.6f}'])
             frame_idx += 1
@@ -244,7 +249,7 @@ def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: floa
         writer_thread = threading.Thread(
             target=_video_writer_loop,
             args=(video_queue, session_dir, config.CAM_VIDEO_CODEC, config.CAM_VIDEO_EXT,
-                  fps, config.CAM_FLUSH_EVERY_N),
+                  fps, config.CAM_FLUSH_EVERY_N, config.CAM_VIDEO_STEM, config.CAM_FRAMES_CSV),
             daemon=True,
         )
         writer_thread.start()
@@ -323,3 +328,80 @@ def camera_bridge_thread_fn(record_queue: "mp.Queue"):
             write_trajectory(traj)
         except Exception:
             pass
+
+
+def camera2_thread_fn(camera_index: int, session_start_wall: float, session_dir,
+                       stop_event: "threading.Event"):
+    """Second, independent camera — video-only, no MediaPipe tracking.
+    Unlike camera_process_fn (a subprocess, needed there to isolate
+    MediaPipe's per-frame CPU cost from the GIL), this runs as a plain
+    thread in the main process: there's no CPU-bound inference here at
+    all, just cap.read() + a queue + disk write via _video_writer_loop
+    (shared verbatim with the primary camera, just pointed at
+    config.CAM2_VIDEO_STEM/CAM2_FRAMES_CSV instead) — exactly the
+    lightweight "capture path never blocked by disk I/O" pattern that
+    function already implements, so there's nothing to duplicate here.
+
+    Takes session_start_wall (not its own independent clock) — the same
+    wall-clock reference the primary camera anchors to (see this module's
+    docstring for why time.time(), not perf_counter()) — so this camera's
+    frames.csv timestamps land on the exact same timeline session.py's
+    _extract_trial_videos() already crops every stream against. No
+    separate sync step needed for this second stream as a result.
+
+    stop_event is state.stop_event directly (a threading.Event, not the
+    mp.Event camera_process_fn's subprocess needs) — call from run.py's
+    main() as a plain threading.Thread, not multiprocessing.Process.
+    """
+    import cv2 as _cv2
+    from ..core import config
+
+    cap = _cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print(f'[CAMERA2] could not open camera index {camera_index} — camera2 recording disabled this session')
+        return
+
+    # See camera_process_fn's identical block for why these are requested
+    # here (before any cap.read()) and why the actually-negotiated values
+    # are read back and logged rather than trusted.
+    cap.set(_cv2.CAP_PROP_FRAME_WIDTH, config.CAM2_CAPTURE_WIDTH)
+    cap.set(_cv2.CAP_PROP_FRAME_HEIGHT, config.CAM2_CAPTURE_HEIGHT)
+    cap.set(_cv2.CAP_PROP_FPS, config.CAM2_CAPTURE_FPS_REQUEST)
+    actual_w = cap.get(_cv2.CAP_PROP_FRAME_WIDTH)
+    actual_h = cap.get(_cv2.CAP_PROP_FRAME_HEIGHT)
+    actual_fps = cap.get(_cv2.CAP_PROP_FPS)
+    print(f'[CAMERA2] requested {config.CAM2_CAPTURE_WIDTH}x{config.CAM2_CAPTURE_HEIGHT}'
+          f'@{config.CAM2_CAPTURE_FPS_REQUEST}fps — camera reports {actual_w:.0f}x{actual_h:.0f}'
+          f'@{actual_fps:.1f}fps (driver-reported FPS is nominal, not measured — camera2_frames.csv '
+          f'is what confirms the real achieved rate)')
+
+    video_queue: "queue.Queue" = queue.Queue(maxsize=config.CAM2_VIDEO_QUEUE_MAXSIZE)
+    writer_thread = threading.Thread(
+        target=_video_writer_loop,
+        args=(video_queue, session_dir, config.CAM_VIDEO_CODEC, config.CAM_VIDEO_EXT,
+              config.CAM2_CAPTURE_FPS_REQUEST, config.CAM_FLUSH_EVERY_N,
+              config.CAM2_VIDEO_STEM, config.CAM2_FRAMES_CSV),
+        daemon=True,
+    )
+    writer_thread.start()
+
+    dropped = 0
+    while not stop_event.is_set():
+        success, frame = cap.read()
+        if not success:
+            continue
+        ts = time.time() - session_start_wall
+        try:
+            video_queue.put_nowait((frame.copy(), ts))
+        except queue.Full:
+            dropped += 1
+
+    video_queue.put(None)
+    writer_thread.join(timeout=config.CAM2_VIDEO_DRAIN_TIMEOUT_SEC)
+    if writer_thread.is_alive():
+        print('[CAMERA2] video writer thread did not finish flushing in time — '
+              'camera2_raw file may be missing trailing frames')
+    if dropped:
+        print(f'[CAMERA2] {dropped} frames dropped to backpressure this session')
+
+    cap.release()
