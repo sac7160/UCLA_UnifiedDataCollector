@@ -1,0 +1,8 @@
+name: watchpad
+channels:
+  - robostack
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+prefix: /Users/changhyeonpark/opt/miniconda3/envs/watchpad

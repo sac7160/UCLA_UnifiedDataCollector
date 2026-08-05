@@ -17,7 +17,10 @@ Trial boundaries:
 process_trial() does the actual cropping: given a (start, end) window and
 a snapshot of the buffered streams, it slices each stream down to that
 window (RTBGN-mapped where possible) and writes trial_XXX/ under
-dataset/<label>/.
+dataset/<label>/, along with everything the final protocol needs to
+reconstruct which condition a trial belongs to (participant, material,
+wrist/finger condition, writing target, and the literal text written) —
+see toggle_recording()'s snapshot of state.current_* at REC-stop time.
 """
 
 import csv
@@ -68,10 +71,11 @@ def toggle_recording():
     touch_detection.audio_worker_fn), but those no longer trim the saved
     trial's boundaries; they're just timestamps recorded alongside it."""
     if not state.rec_active:
-        # state.current_label/current_stimulus are kept up to date live by
-        # the instructor window's class-picker dropdown — nothing to pull
-        # here at REC-start anymore, they're already whatever was last
-        # selected.
+        # state.current_label/current_stimulus/current_writing_target/
+        # current_participant/current_wrist_condition/current_finger_condition
+        # are all kept up to date live by the instructor window — nothing
+        # to pull here at REC-start anymore, they're already whatever was
+        # last selected/picked.
         write_event('rec_start')
         with state.trial_lock:
             for k in state.trial_buffers:
@@ -102,11 +106,26 @@ def toggle_recording():
             snapshot = {k: list(v) for k, v in state.trial_buffers.items()}
         write_event('rec_end')
 
+        # Snapshotted once, here, at REC-stop — not read again later inside
+        # process_trial() (which runs on trial_worker_fn's thread, possibly
+        # a bit later) so a mid-trial change to any of these (e.g. the
+        # experimenter already clicking "next" for the *following* trial
+        # while this one's grace period is still draining) can never leak
+        # into the trial that's actually being saved right now.
         label = state.current_label
+        content = state.current_stimulus
+        writing_target = state.current_writing_target
+        participant = state.current_participant
+        wrist_condition = state.current_wrist_condition
+        finger_condition = state.current_finger_condition
+
         if rec_start is not None and release_offset > rec_start:
             with state.pending_lock:
                 state.pending_starts.append(rec_start)
-            state.trial_queue.put((rec_start, release_offset, snapshot, 'spacebar', label))
+            state.trial_queue.put((
+                rec_start, release_offset, snapshot, 'spacebar', label,
+                writing_target, content, participant, wrist_condition, finger_condition,
+            ))
 
 
 def on_key_press(key):
@@ -126,7 +145,9 @@ def on_key_release(key):
 def trial_worker_fn():
     while not state.stop_event.is_set() or not state.trial_queue.empty():
         try:
-            start, end, snapshot, trigger, label = state.trial_queue.get(timeout=0.2)
+            (start, end, snapshot, trigger, label,
+             writing_target, content, participant, wrist_condition, finger_condition) = \
+                state.trial_queue.get(timeout=0.2)
         except queue.Empty:
             continue
 
@@ -141,7 +162,8 @@ def trial_worker_fn():
                 if start in state.pending_starts:
                     state.pending_starts.remove(start)
 
-            process_trial(start, end, snapshot, trigger, label)
+            process_trial(start, end, snapshot, trigger, label,
+                          writing_target, content, participant, wrist_condition, finger_condition)
         except Exception as e:
             log('TRIAL', f'error while processing: {e}')
 
@@ -182,11 +204,25 @@ def crop_watch_audio_frames(frames, trial_start: float, trial_end: float, sr: in
     return np.concatenate([s for _, s in pieces])
 
 
-def process_trial(start: float, end: float, snapshot: dict, trigger: str, label: str):
+def process_trial(start: float, end: float, snapshot: dict, trigger: str, label: str,
+                  writing_target: str, content: str, participant: str,
+                  wrist_condition: str, finger_condition: str):
     """Crops the buffered snapshot and saves it in dataset/<label>/
     trial_XXX/. `start`/`end` are the REC start/stop offsets — the saved
     trial always spans the full spacebar-to-spacebar window; `trigger` is
-    currently always 'spacebar', kept as a column for any future variant."""
+    currently always 'spacebar', kept as a column for any future variant.
+
+    `label` groups the trial into a folder: a literal single letter for
+    writing_target == 'letter' (dataset/<letter>/, matching the existing
+    per-letter layout the ML pipeline already expects), or the
+    writing_target name itself ('word'/'sentence') otherwise, since a word
+    or sentence trial isn't a member of a small fixed class the way a
+    single letter is — see instructor_window.py's stimulus-picking logic.
+    `content` is the literal text the participant was asked to write
+    (identical to `label` for a letter trial; the actual word/phrase text
+    otherwise) — always saved as metadata regardless, so a word/sentence
+    trial's ground truth is still recoverable even though it isn't baked
+    into the folder name."""
     margin = state.trial_margin
     trial_start = start + margin
     trial_end   = end - margin
@@ -245,6 +281,16 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
     mic_int16 = np.clip(mic_rs * 32767, -32768, 32767).astype(np.int16)
 
     label_use = label if label else 'unlabeled'
+    participant_use = participant if participant else 'unknown_participant'
+    # Deliberately NOT nesting by participant here (e.g. dataset/<participant>/<label>/) —
+    # dataset.py's scan_dataset() (the ML pipeline) expects a flat
+    # <dataset_root>/<label>/trial_*/ layout so it can pool trials across
+    # every participant in one scan for --classes a b c ...; participant
+    # is fully recoverable from metadata.csv/trial_info.json without
+    # needing to be baked into the path. label_use is already exactly
+    # right for all three writing targets — a literal letter for 'letter'
+    # trials, or the writing_target name itself ('word'/'sentence')
+    # otherwise — so this is unchanged from before those existed.
     label_dir = state.trial_dataset_root / label_use
     label_dir.mkdir(parents=True, exist_ok=True)
     trial_idx = len(sorted(label_dir.glob('trial_*'))) + 1
@@ -297,22 +343,25 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
 
     metadata_path = state.trial_dataset_root / 'metadata.csv'
     write_header = not metadata_path.exists()
-    with open(metadata_path, 'a', newline='') as f:
+    with open(metadata_path, 'a', newline='', encoding='utf-8') as f:
         w = csv.writer(f)
         if write_header:
-            w.writerow(['session', 'label', 'trial_idx', 'start_sec', 'end_sec',
-                        'duration_sec', 'margin_sec', 'trigger', 'material'])
+            w.writerow(['session', 'participant', 'label', 'writing_target', 'content',
+                        'trial_idx', 'start_sec', 'end_sec', 'duration_sec', 'margin_sec',
+                        'trigger', 'material', 'wrist_condition', 'finger_condition'])
         w.writerow([
             state.session_dir.name if state.session_dir else '',
-            label_use, trial_idx,
+            participant_use, label_use, writing_target, content, trial_idx,
             f'{trial_start:.6f}', f'{trial_end:.6f}',
             f'{trial_end - trial_start:.6f}', margin, trigger, state.current_material,
+            wrist_condition, finger_condition,
         ])
 
     # Same info as the metadata.csv row above, but living *inside* the
     # trial's own folder — so opening trial_XXX/ alone (without cross-
     # referencing the dataset-wide metadata.csv) is enough to know when it
-    # was collected and what material was active. collected_at is a real
+    # was collected, what condition it was collected under, and what the
+    # participant was actually asked to write. collected_at is a real
     # wall-clock timestamp: session_start_epoch (time.time(), captured at
     # start_session()) plus trial_start (a perf_counter()-based offset from
     # that same moment) — see session.py's sync dict.
@@ -323,15 +372,20 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
         collected_at = None
     trial_info = {
         'session': state.session_dir.name if state.session_dir else '',
+        'participant': participant_use,
         'label': label_use,
+        'writing_target': writing_target,
+        'content': content,
         'trial_idx': trial_idx,
         'trigger': trigger,
         'material': state.current_material,
+        'wrist_condition': wrist_condition,
+        'finger_condition': finger_condition,
         'collected_at': collected_at,
         'start_sec': round(trial_start, 6),
         'end_sec': round(trial_end, 6),
         'duration_sec': round(trial_end - trial_start, 6),
         'margin_sec': margin,
     }
-    with open(trial_dir / 'trial_info.json', 'w') as f:
+    with open(trial_dir / 'trial_info.json', 'w', encoding='utf-8') as f:
         json.dump(trial_info, f, indent=2)

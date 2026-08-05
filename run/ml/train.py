@@ -25,6 +25,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import config
 from dataset import DigitStrokeDataset, scan_dataset, make_splits, save_splits
@@ -33,13 +34,17 @@ from model import build_model, forward_model, MODALITIES
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-def run_epoch(model, modality, loader, device, optimizer=None):
+def run_epoch(model, modality, loader, device, optimizer=None, desc: str = ''):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
     total_loss, n_correct, n_total = 0.0, 0, 0
 
+    # leave=False: the bar clears itself once the epoch finishes, so 30
+    # epochs' worth of bars don't pile up in the terminal — only the
+    # [EPOCH ...] summary line printed after this stays behind.
+    pbar = tqdm(loader, desc=desc, leave=False, ncols=100)
     with torch.set_grad_enabled(is_train):
-        for audio, imu, label in loader:
+        for audio, imu, label in pbar:
             audio, imu, label = audio.to(device), imu.to(device), label.to(device)
             logits = forward_model(model, modality, audio, imu)
             loss = F.cross_entropy(logits, label)
@@ -52,6 +57,7 @@ def run_epoch(model, modality, loader, device, optimizer=None):
             total_loss += loss.item() * label.size(0)
             n_correct += (logits.argmax(dim=1) == label).sum().item()
             n_total += label.size(0)
+            pbar.set_postfix(loss=f'{total_loss / n_total:.4f}', acc=f'{n_correct / n_total:.3f}')
 
     return total_loss / n_total, n_correct / n_total
 
@@ -93,6 +99,11 @@ def main():
     parser.add_argument('--imu-source', choices=list(config.IMU_FILENAMES), default=config.DEFAULT_IMU_SOURCE,
                          help='"fingertip" = fingertip_imu.csv (needs --finger), "watch" = imu.csv')
     parser.add_argument('--finger', default=config.DEFAULT_FINGER, help='only used when --imu-source fingertip')
+    parser.add_argument('--imu-downsample-hz', type=float, default=None,
+                         help='only used when --imu-source watch — simulates the watch sensor having only '
+                              'sampled at this rate (nearest-neighbor, not interpolation), to test whether '
+                              'temporal resolution explains an accuracy gap vs. fingertip_imu (which natively '
+                              'runs at camera frame rate, ~20-30Hz)')
     parser.add_argument('--train-frac', type=float, default=0.7)
     parser.add_argument('--val-frac', type=float, default=0.15)
     parser.add_argument('--test-frac', type=float, default=0.15)
@@ -106,6 +117,9 @@ def main():
                               '--modality/--audio-source/--imu-source), pass a distinct --out-dir '
                               'for each, or later runs will overwrite earlier ones\' checkpoint + splits.')
     args = parser.parse_args()
+
+    if args.imu_downsample_hz is not None and args.imu_source != 'watch':
+        parser.error('--imu-downsample-hz only applies when --imu-source watch')
 
     torch.manual_seed(args.seed)
     random.seed(args.seed)
@@ -123,14 +137,15 @@ def main():
                 audio_source=args.audio_source, imu_source=args.imu_source)
     print(f'[SETUP] {len(splits["train"])} train / {len(splits["val"])} val / '
           f'{len(splits["test"])} test trials  (classes={args.classes}, modality="{args.modality}", '
-          f'audio_source="{args.audio_source}", imu_source="{args.imu_source}", finger="{args.finger}")')
+          f'audio_source="{args.audio_source}", imu_source="{args.imu_source}", finger="{args.finger}"'
+          f'{f", imu_downsample_hz={args.imu_downsample_hz}" if args.imu_downsample_hz else ""})')
     print(f'[SETUP] split saved to {splits_path} — test.py will load this exact split, '
           f'so the test set stays held-out')
 
-    train_ds = DigitStrokeDataset(splits['train'], finger=args.finger,
-                                   audio_source=args.audio_source, imu_source=args.imu_source)
-    val_ds = DigitStrokeDataset(splits['val'], finger=args.finger,
-                                 audio_source=args.audio_source, imu_source=args.imu_source)
+    train_ds = DigitStrokeDataset(splits['train'], finger=args.finger, audio_source=args.audio_source,
+                                   imu_source=args.imu_source, watch_downsample_hz=args.imu_downsample_hz)
+    val_ds = DigitStrokeDataset(splits['val'], finger=args.finger, audio_source=args.audio_source,
+                                 imu_source=args.imu_source, watch_downsample_hz=args.imu_downsample_hz)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False)
 
@@ -142,8 +157,10 @@ def main():
     best_epoch = 0
     ckpt_path = args.out_dir / 'best_model.pt'
     for epoch in range(1, args.epochs + 1):
-        train_loss, train_acc = run_epoch(model, args.modality, train_loader, device, optimizer)
-        val_loss, val_acc = run_epoch(model, args.modality, val_loader, device, optimizer=None)
+        train_loss, train_acc = run_epoch(model, args.modality, train_loader, device, optimizer,
+                                           desc=f'epoch {epoch:3d}/{args.epochs} [train]')
+        val_loss, val_acc = run_epoch(model, args.modality, val_loader, device, optimizer=None,
+                                       desc=f'epoch {epoch:3d}/{args.epochs} [val]  ')
         print(f'[EPOCH {epoch:3d}/{args.epochs}] '
               f'train_loss={train_loss:.4f} train_acc={train_acc:.3f}  '
               f'val_loss={val_loss:.4f} val_acc={val_acc:.3f}')
@@ -153,6 +170,14 @@ def main():
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             best_epoch = epoch
+            # Re-create right before every save, not just once at startup —
+            # cloud-synced folders (iCloud Desktop/Documents sync is the
+            # common case on macOS) can evict/remove a directory mid-run
+            # without the script doing anything wrong; recreating here is
+            # cheap (no-op if it's already there) and means a save can't
+            # crash the whole run over something outside this script's
+            # control.
+            args.out_dir.mkdir(parents=True, exist_ok=True)
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'classes': args.classes,
@@ -160,9 +185,12 @@ def main():
                 'finger': args.finger,
                 'audio_source': args.audio_source,
                 'imu_source': args.imu_source,
+                'imu_downsample_hz': args.imu_downsample_hz,
                 'val_acc': val_acc,
                 'epoch': epoch,
             }, ckpt_path)
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)   # same defensive re-check before the final plot/history writes
 
     curves_path = args.out_dir / 'training_curves.png'
     plot_training_curves(history, args.modality, best_epoch, curves_path)
