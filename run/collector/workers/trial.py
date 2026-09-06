@@ -293,7 +293,20 @@ def process_trial(start: float, end: float, snapshot: dict, trigger: str, label:
     # otherwise — so this is unchanged from before those existed.
     label_dir = state.trial_dataset_root / label_use
     label_dir.mkdir(parents=True, exist_ok=True)
-    trial_idx = len(sorted(label_dir.glob('trial_*'))) + 1
+    # NOT len(glob('trial_*')) + 1 — that counts existing folders, which
+    # undercounts (and collides with an existing higher-numbered trial)
+    # the moment any trial in the middle gets deleted by hand. Scanning
+    # for the highest actual trial_NNN and adding 1 is immune to gaps —
+    # deleting trial_007 out of trial_001..009 still makes the next one
+    # trial_010, never re-colliding with (and silently overwriting) the
+    # existing trial_009.
+    existing_indices = []
+    for p in label_dir.glob('trial_*'):
+        try:
+            existing_indices.append(int(p.name.split('_', 1)[1]))
+        except (IndexError, ValueError):
+            continue   # not a trial_NNN-shaped name — ignore rather than crash
+    trial_idx = max(existing_indices, default=0) + 1
     trial_dir = label_dir / f'trial_{trial_idx:03d}'
     trial_dir.mkdir(parents=True, exist_ok=True)
 

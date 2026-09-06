@@ -146,6 +146,26 @@ class InstructorWindow(QtWidgets.QMainWindow):
         cond_row.addStretch(1)
         outer.addLayout(cond_row)
 
+        # ── supplementary task override: checking either one replaces the
+        # normal writing-target-based folder label with 'supplementary1'/
+        # 'supplementary2' (see _pick_next_item()) and locks in the
+        # protocol's fixed conditions for that block (wood surface, word
+        # writing target, plus the matching wrist/finger condition) — see
+        # _on_supplementary_changed(). Mutually exclusive: checking one
+        # unchecks the other. ──
+        supp_row = QtWidgets.QHBoxLayout()
+        supp_row.addWidget(QtWidgets.QLabel('supplementary:'))
+        self.supp1_check = QtWidgets.QCheckBox('Supplementary 1 (wrist fixed)')
+        self.supp1_check.setFocusPolicy(QtCore.Qt.NoFocus)   # same spacebar-safety reasoning as every button here
+        self.supp1_check.stateChanged.connect(lambda st: self._on_supplementary_changed('supplementary1', st))
+        supp_row.addWidget(self.supp1_check)
+        self.supp2_check = QtWidgets.QCheckBox('Supplementary 2 (middle finger)')
+        self.supp2_check.setFocusPolicy(QtCore.Qt.NoFocus)
+        self.supp2_check.stateChanged.connect(lambda st: self._on_supplementary_changed('supplementary2', st))
+        supp_row.addWidget(self.supp2_check)
+        supp_row.addStretch(1)
+        outer.addLayout(supp_row)
+
         # ── stimulus row: writing target + next button, replacing the old
         # direct letter-picker dropdown. See _pick_next_item(). ──
         stim_row = QtWidgets.QHBoxLayout()
@@ -395,6 +415,36 @@ class InstructorWindow(QtWidgets.QMainWindow):
     def _on_next_clicked(self):
         self._pick_next_item()
 
+    def _on_supplementary_changed(self, which: str, qt_state: int):
+        """which is 'supplementary1' or 'supplementary2' — whichever
+        checkbox's stateChanged fired. Checking one enforces the finalized
+        protocol's fixed conditions for that block (wood surface, word
+        writing target — see the protocol summary's "(only writing word,
+        wood)" note) and the matching wrist/finger condition, then locks
+        the writing-target combo so it can't drift to letter/sentence by
+        accident while a supplementary checkbox is active. Unchecking
+        releases that lock but deliberately leaves material/wrist/finger
+        wherever they landed — not worth guessing what the experimenter
+        wants next."""
+        checked = (qt_state == QtCore.Qt.Checked)
+        other = self.supp2_check if which == 'supplementary1' else self.supp1_check
+        if checked:
+            other.blockSignals(True)   # mutually exclusive — set the other's UI state without
+            other.setChecked(False)    # re-entering this handler recursively for it
+            other.blockSignals(False)
+            state.current_supplementary = which
+            self._on_material_clicked('wood')
+            if which == 'supplementary1':
+                self.wrist_combo.setCurrentText('fixed')
+            elif which == 'supplementary2':
+                self.finger_condition_combo.setCurrentText('middle')
+            self.target_combo.setCurrentText('word')
+            self.target_combo.setEnabled(False)
+        else:
+            state.current_supplementary = ''
+            self.target_combo.setEnabled(True)
+        self._pick_next_item()
+
     def _pick_next_item(self):
         """Draws a new random stimulus for the current writing target and
         pushes it live to state.current_label/current_stimulus — mirrors
@@ -404,12 +454,15 @@ class InstructorWindow(QtWidgets.QMainWindow):
 
         current_label groups the trial into a dataset folder: the literal
         letter for writing_target == 'letter' (dataset/<letter>/, same
-        layout the ML pipeline already expects), or the writing_target
-        name itself ('word'/'sentence') for the other two, since a word or
-        sentence isn't a member of a small, fixed class the way a single
-        letter is. current_stimulus is always the literal text to display/
-        write, in every case — see trial.process_trial()'s `content` field
-        for where the ground-truth text ends up saved."""
+        layout the ML pipeline already expects), the writing_target name
+        itself ('word'/'sentence') for the other two, OR — overriding
+        both — 'supplementary1'/'supplementary2' whenever a supplementary
+        checkbox is active (see _on_supplementary_changed()), so those
+        trials land in their own folders instead of mixing into
+        dataset/word/ alongside main-task data. current_stimulus is always
+        the literal text to display/write, in every case — see
+        trial.process_trial()'s `content` field for where the
+        ground-truth text ends up saved."""
         target = state.current_writing_target
         try:
             content = phrase_set.random_item(target, config.PHRASE_SET_PATH)
@@ -418,7 +471,10 @@ class InstructorWindow(QtWidgets.QMainWindow):
             print(f'[STIMULUS] {e}')
             return
 
-        label = content if target == 'letter' else target
+        if state.current_supplementary:
+            label = state.current_supplementary
+        else:
+            label = content if target == 'letter' else target
         state.current_label = label
         state.current_stimulus = content
         self.class_preview_label.setText(content)

@@ -210,7 +210,7 @@ def camera_process_fn(camera_index: int, camera_pitch_deg, camera_roll_deg: floa
         max_num_hands=1, smoothing_window=config.CAM_SMOOTHING_WINDOW,
         gravity_mm_s2=gravity_mm_s2, ema_alpha=config.CAM_EMA_ALPHA,
     )
-    cap = _cv2.VideoCapture(camera_index)
+    cap = _cv2.VideoCapture(camera_index, _cv2.CAP_DSHOW)
     if not cap.isOpened():
         record_queue.put(None)
         return
@@ -356,7 +356,7 @@ def camera2_thread_fn(camera_index: int, session_start_wall: float, session_dir,
     import cv2 as _cv2
     from ..core import config
 
-    cap = _cv2.VideoCapture(camera_index)
+    cap = _cv2.VideoCapture(camera_index, _cv2.CAP_DSHOW)
     if not cap.isOpened():
         print(f'[CAMERA2] could not open camera index {camera_index} — camera2 recording disabled this session')
         return

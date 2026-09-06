@@ -1,0 +1,53 @@
+{
+  "label": "rigid",
+  "n_trials": 611,
+  "stats": {
+    "thumb": {
+      "pos_spread_trial_mean_rms_mm": 5.78785414244372,
+      "pos_spread_frame_centroid_rms_mm": 6.075681936402587,
+      "accel_rms_mm_s2": 359.1060286126552,
+      "gyro_rms_rad_s": 1.604240888582209,
+      "path_length_mm_per_s": 71.7107853981223
+    },
+    "index": {
+      "pos_spread_trial_mean_rms_mm": 7.67896869321384,
+      "pos_spread_frame_centroid_rms_mm": 5.756535540915012,
+      "accel_rms_mm_s2": 290.9932425561063,
+      "gyro_rms_rad_s": 1.2569040686171038,
+      "path_length_mm_per_s": 63.08453514925625
+    },
+    "middle": {
+      "pos_spread_trial_mean_rms_mm": 5.62106473908049,
+      "pos_spread_frame_centroid_rms_mm": 2.896440101514335,
+      "accel_rms_mm_s2": 229.72107974825838,
+      "gyro_rms_rad_s": 0.7196658953146247,
+      "path_length_mm_per_s": 49.84521344014368
+    },
+    "ring": {
+      "pos_spread_trial_mean_rms_mm": 5.030339611154031,
+      "pos_spread_frame_centroid_rms_mm": 2.8232305898862444,
+      "accel_rms_mm_s2": 192.6145299250079,
+      "gyro_rms_rad_s": 0.8369667189708296,
+      "path_length_mm_per_s": 42.84720732868071
+    },
+    "pinky": {
+      "pos_spread_trial_mean_rms_mm": 4.4560487636058355,
+      "pos_spread_frame_centroid_rms_mm": 3.1136755791007653,
+      "accel_rms_mm_s2": 184.77828747886056,
+      "gyro_rms_rad_s": 0.9396980425212476,
+      "path_length_mm_per_s": 40.10185592819391
+    }
+  },
+  "pairwise_distance_std_mm": {
+    "thumb-index": 5.551959763846387,
+    "thumb-middle": 4.653929607751059,
+    "thumb-ring": 5.416641443589796,
+    "thumb-pinky": 6.5714873306725075,
+    "index-middle": 3.564267503710339,
+    "index-ring": 3.8100739199523415,
+    "index-pinky": 3.9528806996441284,
+    "middle-ring": 2.0222613718905036,
+    "middle-pinky": 2.869598222606166,
+    "ring-pinky": 1.6238567715406225
+  }
+}

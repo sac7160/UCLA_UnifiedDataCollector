@@ -171,8 +171,8 @@ TOUCH_OFF_THRESHOLD_DB = 5.0
 # back to TOUCH_ON_THRESHOLD_DB / TOUCH_OFF_THRESHOLD_DB above.
 MATERIAL_THRESHOLDS = {
     'wood':    (25.0, 22.0),
-    'fabric':  (8.0, 5.0),
-    'acrylic': (8.0, 5.0),
+    'fabric':  (6.0, 5.0),
+    'acrylic': (10.0, 7.0),
 }
 
 TOUCH_MIN_ON_MS_DEFAULT  = 30.0

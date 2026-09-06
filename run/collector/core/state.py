@@ -209,3 +209,13 @@ current_finger_condition: str = 'index'  # 'index' / 'middle' — which finger t
 # against the protocol's "2 min writing, 1 min break" structure — doesn't
 # gate or affect what gets captured/saved in any way. None = not running.
 task_timer_start: float | None = None   # offset() value when last started
+
+# ─── Supplementary-task override (instructor_window.py owns writes) ──────────
+# '' / 'supplementary1' / 'supplementary2' — set by the instructor window's
+# mutually-exclusive supplementary checkboxes. When non-empty, this REPLACES
+# the normal writing-target-based folder label (see
+# InstructorWindow._pick_next_item()), so these trials land in
+# dataset/supplementary1/ or dataset/supplementary2/ instead of
+# dataset/word/ — kept clearly separate from main-task data even though
+# both use writing_target='word'.
+current_supplementary: str = ''

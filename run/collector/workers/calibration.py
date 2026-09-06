@@ -33,7 +33,7 @@ def _run_precalibration_process(camera_index: int, result_queue: "mp.Queue", mir
         print(f'[CALIBRATE] loaded existing calibration from {calibration.get("timestamp", "?")} '
               f'(scale_factor={calibration.get("scale_factor"):.4f})')
 
-    cap = _cv2.VideoCapture(camera_index)
+    cap = _cv2.VideoCapture(camera_index, _cv2.CAP_DSHOW)
     if not cap.isOpened():
         print(f'[CALIBRATE] could not open camera index={camera_index} for pre-recording calibration '
               f'— continuing with {"loaded" if calibration else "no"} calibration')
