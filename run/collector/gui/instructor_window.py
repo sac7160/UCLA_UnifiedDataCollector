@@ -11,6 +11,18 @@ Stimulus selection (writing target + "next" button) replaces the old
 direct letter-picker dropdown — see _pick_next_item()'s docstring for how
 letter/word/sentence map to state.current_label/current_stimulus, and
 core/phrase_set.py for where word/sentence text actually comes from.
+
+Every QPushButton here is set to QtCore.Qt.NoFocus. Qt activates a focused
+QPushButton on Space/Enter by default — the same physical spacebar press
+trial.py's global pynput listener already uses to start/stop REC. If any
+button happened to hold keyboard focus (clicking near it, tabbing, etc.),
+that same spacebar press would ALSO fire the button's own .clicked() —
+harmless for most buttons, but for rec_btn specifically it meant a single
+spacebar press could toggle REC twice (once via pynput, once via Qt's own
+button activation), silently corrupting trial boundaries. NoFocus removes
+every button from the keyboard-focus chain entirely — spacebar reaches
+pynput's global listener and nothing else; every button here still works
+exactly the same via mouse click.
 """
 
 import numpy as np
@@ -46,6 +58,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
 
         rec_row = QtWidgets.QHBoxLayout()
         self.rec_btn = QtWidgets.QPushButton('● START RECORDING')
+        self.rec_btn.setFocusPolicy(QtCore.Qt.NoFocus)   # see NoFocus note in this file's docstring
         self.rec_btn.setStyleSheet('font-size: 16px; font-weight: bold; padding: 8px; '
                                     'background-color: #d62728; color: white;')
         self.rec_btn.clicked.connect(self._on_rec_clicked)
@@ -61,6 +74,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
         rec_row.addWidget(self.status_label)
         rec_row.addSpacing(20)
         self.quit_btn = QtWidgets.QPushButton('■ QUIT')
+        self.quit_btn.setFocusPolicy(QtCore.Qt.NoFocus)
         self.quit_btn.setStyleSheet('font-size: 13px; font-weight: bold; padding: 6px 12px; '
                                      'background-color: #444; color: white;')
         self.quit_btn.clicked.connect(self._on_quit_clicked)
@@ -75,6 +89,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
                                            'background-color: #eef4ff; border-radius: 3px;')
         for name in config.MATERIAL_PRESETS:
             btn = QtWidgets.QPushButton(name)
+            btn.setFocusPolicy(QtCore.Qt.NoFocus)
             btn.clicked.connect(lambda checked=False, n=name: self._on_material_clicked(n))
             meta_row.addWidget(btn)
         meta_row.addWidget(self.material_label)
@@ -142,6 +157,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
         stim_row.addWidget(self.target_combo)
 
         self.next_btn = QtWidgets.QPushButton('\u21bb next')
+        self.next_btn.setFocusPolicy(QtCore.Qt.NoFocus)
         self.next_btn.setStyleSheet('font-weight: bold; padding: 4px 10px;')
         self.next_btn.clicked.connect(self._on_next_clicked)
         stim_row.addWidget(self.next_btn)
@@ -166,9 +182,11 @@ class InstructorWindow(QtWidgets.QMainWindow):
             'padding: 4px 14px; background-color: #222; color: #2ecc40; border-radius: 4px;')
         timer_row.addWidget(self.task_timer_label)
         self.task_timer_start_btn = QtWidgets.QPushButton('\u25b6 start')
+        self.task_timer_start_btn.setFocusPolicy(QtCore.Qt.NoFocus)
         self.task_timer_start_btn.clicked.connect(self._on_task_timer_start_clicked)
         timer_row.addWidget(self.task_timer_start_btn)
         self.task_timer_reset_btn = QtWidgets.QPushButton('\u25a0 reset')
+        self.task_timer_reset_btn.setFocusPolicy(QtCore.Qt.NoFocus)
         self.task_timer_reset_btn.clicked.connect(self._on_task_timer_reset_clicked)
         timer_row.addWidget(self.task_timer_reset_btn)
         timer_row.addWidget(QtWidgets.QLabel('  (green <1:30, amber <2:00, red \u22652:00 — writing-block guide only)'))
@@ -269,6 +287,7 @@ class InstructorWindow(QtWidgets.QMainWindow):
                                          'background-color: #eee; padding: 4px; border-radius: 3px;')
         self.minmax_label.setAlignment(QtCore.Qt.AlignCenter)
         self.reset_minmax_btn = QtWidgets.QPushButton('reset min/max')
+        self.reset_minmax_btn.setFocusPolicy(QtCore.Qt.NoFocus)
         self.reset_minmax_btn.clicked.connect(self._reset_minmax)
         minmax_row.addWidget(self.minmax_label, 1)
         minmax_row.addWidget(self.reset_minmax_btn)
@@ -405,9 +424,17 @@ class InstructorWindow(QtWidgets.QMainWindow):
         self.class_preview_label.setText(content)
 
     def _on_task_timer_start_clicked(self):
+        # Temporary diagnostic — helps pin down a reported "spacebar also
+        # starts the task timer" issue: if this print appears in the
+        # console right when spacebar is pressed (rather than an actual
+        # mouse click on the button), that confirms the button is still
+        # reachable via keyboard somehow, despite NoFocus — remove once
+        # that's confirmed one way or the other.
+        print('[TASK TIMER] start clicked/activated')
         state.task_timer_start = offset()
 
     def _on_task_timer_reset_clicked(self):
+        print('[TASK TIMER] reset clicked/activated')
         state.task_timer_start = None
         self.task_timer_label.setText('00:00')
         self.task_timer_label.setStyleSheet(
